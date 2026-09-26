@@ -1,0 +1,25 @@
+{
+  "name": "nikola-electron",
+  "version": "1.0.0",
+  "description": "Nikola private local AI desktop assistant",
+  "author": "Nikola",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "dependencies": {
+    "marked": "^11.1.1"
+  },
+  "build": {
+    "appId": "com.nikola.localai",
+    "productName": "Nikola",
+    "files": [
+      "**/*"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.6.4"
+  }
+}

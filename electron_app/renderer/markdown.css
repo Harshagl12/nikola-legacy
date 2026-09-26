@@ -1,0 +1,6 @@
+.message-body .message-paragraph { margin: 0 0 7px; }
+.message-body .message-paragraph:last-child { margin-bottom: 0; }
+.message-body .message-heading { margin: 5px 0 8px; color: #fff; font-size: 14px; }
+.message-body .message-list { margin: 4px 0 8px; padding-left: 19px; }
+.message-body code { padding: 1px 4px; color: #a5f3fc; border-radius: 4px; background: #0f1720; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.message-code { margin: 8px 0; padding: 10px; overflow: auto; color: #dce6f2; border: 1px solid rgba(255,255,255,.08); border-radius: 7px; background: #0b0d12; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }

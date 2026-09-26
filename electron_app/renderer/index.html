@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; style-src 'self'; script-src 'self'; connect-src http://127.0.0.1:8000; img-src 'self' data: blob:; font-src 'self'; media-src 'self' blob:; form-action 'none';">
+  <title>Nikola AI</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style-v2.css">
+  <link rel="stylesheet" href="markdown.css">
+</head>
+<body>
+  <main id="ball-view" class="ball-view" aria-label="Nikola assistant">
+    <button id="assistant-ball" class="assistant-ball" title="Open Nikola workspace" aria-label="Open Nikola workspace">
+      <span class="ball-core"></span><span class="ball-mark">N</span><span class="ball-state">LOCAL</span>
+    </button>
+  </main>
+  <main id="workspace-view" class="workspace-view hidden">
+    <header class="titlebar">
+      <div class="brand"><span class="brand-glyph">✦</span><span>NIKOLA</span><small>PRIVATE LOCAL AI</small></div>
+      <div class="runtime"><span id="runtime-dot" class="state-dot"></span><span id="runtime-label">INITIALIZING</span><span id="model-label">Qwen3 local</span></div>
+      <div class="window-actions"><button id="hide-btn" title="Return to assistant ball">−</button><button id="quit-btn" title="Quit Nikola">×</button></div>
+    </header>
+    <div class="workspace-body">
+      <aside class="sidebar">
+        <button id="new-chat-btn" class="new-chat"><span>＋</span> New chat</button>
+        <label class="search-box"><span>⌕</span><input id="search-input" placeholder="Search conversations" autocomplete="off"></label>
+        <section class="nav-section"><h2>Conversations</h2><div id="conversation-list" class="conversation-list"><button class="conversation active">Current conversation</button></div></section>
+        <section class="nav-section"><h2>Workspace</h2><button class="nav-item active" data-view="chat">◈ <span>Conversation</span></button><button class="nav-item" data-view="documents">▧ <span>Document vault</span></button><button class="nav-item" data-view="workflows">⌘ <span>Workflows</span></button></section>
+        <section class="nav-section system-section"><h2>System</h2><div class="system-row"><span id="backend-dot" class="state-dot"></span>Backend</div><div class="system-row"><span id="rag-dot" class="state-dot"></span>RAG</div><div class="system-row"><span id="voice-dot" class="state-dot"></span>Voice</div></section>
+        <button id="settings-btn" class="nav-item settings">⚙ <span>Settings</span></button>
+      </aside>
+      <section class="content-panel">
+        <div class="content-heading"><div><p class="eyebrow">LOCAL WORKSPACE</p><h1 id="view-title">Conversation</h1></div><div id="connection-copy" class="connection-copy">Checking services...</div></div>
+        <div id="chat-view" class="view active-view">
+          <div id="messages" class="messages"><div class="empty-state"><div class="empty-glyph">✦</div><h2>Ask Nikola</h2><p>Your private assistant, running on this computer.</p><div class="prompt-grid"><button data-prompt="Explain a concept clearly">Explain a concept</button><button data-prompt="Summarize my indexed documents">Summarize documents</button><button data-prompt="Help me write code">Help me write code</button></div></div></div>
+          <div id="typing" class="typing hidden"><span></span><span></span><span></span><b>Generating locally</b></div>
+          <form id="composer" class="composer"><button id="attach-btn" type="button" title="Attach document">＋</button><textarea id="chat-input" rows="1" placeholder="Ask Nikola anything..." autocomplete="off"></textarea><button id="mic-btn" type="button" title="Voice input">◉</button><button id="stop-btn" type="button" class="stop-btn hidden" title="Stop generation">■</button><button id="send-btn" type="submit" title="Send message">↑</button><input id="file-input" type="file" hidden multiple accept=".pdf,.txt,.md,.py"></form>
+          <p class="composer-note">Enter to send · Shift + Enter for a new line · Esc to stop</p>
+        </div>
+        <div id="documents-view" class="view"><div class="vault-toolbar"><div><p class="eyebrow">LOCAL KNOWLEDGE</p><h2>Document vault</h2></div><button id="add-docs-btn" class="primary-btn">＋ Add documents</button></div><div id="documents-list" class="document-grid"></div><button id="clear-docs-btn" class="danger-link">Clear vault data</button></div>
+        <div id="workflows-view" class="view"><p class="eyebrow">AUTOMATION</p><h2>Workflows</h2><div id="workflows-list" class="workflow-list"><p class="muted">No confirmed workflows yet.</p></div></div>
+      </section>
+    </div>
+  </main>
+  <script src="services/api-client.js"></script>
+  <script src="components.js"></script>
+  <script src="app-v2.js"></script>
+</body>
+</html>
