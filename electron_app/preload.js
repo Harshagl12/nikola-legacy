@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('api', {
   chooseDocuments: () => ipcRenderer.invoke('choose-documents'),
   restartBackend: () => ipcRenderer.invoke('restart-backend'),
   toggleVoice: () => ipcRenderer.invoke('toggle-voice'),
+  captureScreen: () => ipcRenderer.invoke('capture-screen'),
   updatePanelState: (isOpen, side) => ipcRenderer.send('update-panel-state', {isOpen, side}),
   onWindowMode: (callback) => ipcRenderer.on('window-mode', (_event, mode) => callback(mode)),
   onNewChat: (callback) => ipcRenderer.on('new-chat', callback),

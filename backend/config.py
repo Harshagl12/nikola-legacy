@@ -21,13 +21,16 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen3-Embedding-0.6B"
     EMBEDDING_MODEL_PATH: str = str(BACKEND_ROOT / "models" / "Qwen3-Embedding-0.6B")
     VISION_MODEL: str = "moondream"
+    VISION_MODEL_PATH: str = str(BACKEND_ROOT / "models" / "moondream2-text-model-f16_ct-vicuna.gguf")
+    VISION_MMPROJ_PATH: str = str(BACKEND_ROOT / "models" / "moondream2-mmproj-f16-20250414.gguf")
+    VISION_SERVER_URL: str = "http://127.0.0.1:8081/v1"
     LLAMA_SERVER_PORT: int = 8080
     LLAMA_SERVER_URL: str = "http://127.0.0.1:8080/v1"
     MAX_DAILY_RESPONSES: int | None = None
     ENABLE_OLLAMA_FALLBACK: bool = False
 
     # File system & RAG
-    VAULT_PATH: str = "~/vault"
+    VAULT_PATH: str = str(PROJECT_ROOT / "vault")
     CHROMA_PATH: str = "~/nikola_chroma"
     CHROMA_COLLECTION: str = "nikola_documents_v2"
 

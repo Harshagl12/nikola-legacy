@@ -1,5 +1,6 @@
 import sys
 import re
+import secrets
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -32,12 +33,12 @@ class FirstRunSetup:
 
         # --- shared state ---
         data = {
-            "token":   tk.StringVar(value="8751252544:AAGoPPl03ozBklO9xyiE60x1GYrRyicKjcs"),
-            "userid":  tk.StringVar(value="5152690553"),
+            "token":   tk.StringVar(value=""),
+            "userid":  tk.StringVar(value=""),
             "voice":   tk.BooleanVar(value=True),
             "whisper": tk.StringVar(value="base"),
-            "vault":   tk.StringVar(value=str(Path.home() / "vault")),
-            "chroma":  tk.StringVar(value=str(Path.home() / "nikola_chroma")),
+            "vault":   tk.StringVar(value=str(self.nikola_root / "vault")),
+            "chroma":  tk.StringVar(value=str(self.nikola_root / "nikola_chroma")),
             "startup": tk.BooleanVar(value=False),
         }
 
@@ -195,6 +196,7 @@ CHROMA_PATH={data['chroma'].get()}
 BOT_TOKEN={data['token'].get().strip()}
 ALLOWED_USER_ID={data['userid'].get().strip()}
 BACKEND_URL=http://localhost:8000
+NIKOLA_API_KEY={secrets.token_urlsafe(32)}
 RUN_COMMANDS=false
 VOICE_ENABLED={str(data['voice'].get()).lower()}
 WAKE_WORD=hey nikola

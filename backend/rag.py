@@ -179,6 +179,7 @@ class RAGPipeline:
                 embeddings=embeddings
             )
             self._file_hashes[filename] = file_hash
+            self._files_cache = None
             self._rebuild_bm25_index()
             logger.info("Indexed file with SmartChunker", filename=filename, chunks_added=len(embeddings))
         
@@ -333,6 +334,7 @@ class RAGPipeline:
                 logger.info("Deleted vault file", path=str(vault_file))
             
             self._rebuild_bm25_index()
+            self._files_cache = None
             return len(ids)
         finally:
             self.in_progress_deletes.discard(filename)

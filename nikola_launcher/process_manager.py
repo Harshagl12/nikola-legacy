@@ -12,6 +12,8 @@ import sys
 import json
 import shutil
 import logging
+import re
+import hashlib
 from logging.handlers import RotatingFileHandler
 from threading import Thread
 import psutil
@@ -51,6 +53,7 @@ class ProcessManager:
 
         self.processes = {
             'llama_server': None,
+            'vision_server': None,
             'backend': None,
             'telegram': None,
             'electron': None
@@ -107,9 +110,13 @@ class ProcessManager:
         if server_path:
             return server_path
 
-        local_exe = self.root / "backend" / "tools" / "llama-server.exe"
-        if local_exe.exists():
-            return str(local_exe)
+        for local_exe in (
+            self.root / "backend" / "tools" / "llama-avx2" / "llama-server.exe",
+            self.root / "backend" / "tools" / "llama-generic" / "llama-server.exe",
+            self.root / "backend" / "tools" / "llama-server.exe",
+        ):
+            if local_exe.is_file():
+                return str(local_exe)
 
         return None
     
@@ -128,34 +135,118 @@ class ProcessManager:
             )
             return True
 
-        model_path = self.root / "backend" / "models" / "Qwen3-1.7B-Q4_K_M.gguf"
-        if not model_path.exists():
-            models_dir = self.root / "backend" / "models"
-            qwen_files = list(models_dir.glob("*Qwen*.gguf"))
-            if qwen_files:
-                model_path = qwen_files[0]
+        models_dir = self.root / "backend" / "models"
+        model_candidates = (
+            models_dir / "Qwen3-1.7B-Q4_K_M.gguf",
+            models_dir / "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        )
+        model_path = next((path for path in model_candidates if path.is_file()), None)
+        if model_path is None:
+            qwen_files = sorted(
+                path for path in models_dir.glob("*.gguf")
+                if "qwen" in path.name.lower()
+            )
+            model_path = qwen_files[0] if qwen_files else None
 
-        if not model_path.exists():
+        if model_path is None:
             self._log("Qwen3 model GGUF not found yet. Backend will initialize when model is ready.")
             return True
 
         try:
-            self._log("Starting llama-server for Qwen3 1.7B on port 8080...")
-            kill_port(8080)
+            with urllib.request.urlopen("http://127.0.0.1:8080/v1/models", timeout=2) as response:
+                if response.status == 200:
+                    self._log("Existing local llama-server is responsive; leaving it untouched.")
+                    return True
+        except urllib.error.HTTPError as error:
+            self._log(
+                f"Port 8080 returned HTTP {error.code}; starting the managed Qwen service."
+            )
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+
+        try:
+            self._log(f"Starting llama-server for Qwen text model on port 8080 using {model_path.name}...")
             self.processes['llama_server'] = subprocess.Popen(
                 [server_path, "-m", str(model_path), "--port", "8080", "-ngl", "99", "--host", "127.0.0.1"],
                 cwd=str(self.root),
                 creationflags=0x08000000 if sys.platform == "win32" else 0
             )
-            self._log("llama-server started for Qwen3 (PID: {})".format(self.processes['llama_server'].pid))
-            return True
+            self._log("Qwen llama-server started (PID: {})".format(self.processes['llama_server'].pid))
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if self.processes["llama_server"].poll() is not None:
+                    self._log("Qwen llama-server exited before becoming ready.")
+                    return False
+                try:
+                    with urllib.request.urlopen(
+                        "http://127.0.0.1:8080/v1/models",
+                        timeout=2,
+                    ) as response:
+                        if response.status == 200:
+                            self._log("Qwen llama-server is ready.")
+                            return True
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    time.sleep(1)
+            self._log("Timed out waiting for Qwen llama-server readiness.")
+            return False
         except Exception as e:
-            self._log(f"Failed to start llama-server: {e}. Falling back to in-process LLMEngine.")
+            self._log(f"Failed to start Qwen llama-server: {e}.")
             return False
 
     def ensure_ollama(self):
         """Ollama has been completely removed in favor of Qwen3 + llama-server."""
         return self.ensure_llama_server()
+
+    def ensure_vision_server(self):
+        """Start the local Moondream2 llama.cpp multimodal server when assets exist."""
+        server_path = self._resolve_llama_server_path()
+        model_dir = self.root / "backend" / "models"
+        model_path = model_dir / "moondream2-text-model-f16_ct-vicuna.gguf"
+        mmproj_path = model_dir / "moondream2-mmproj-f16-20250414.gguf"
+        if not model_path.is_file() or not mmproj_path.is_file():
+            self._log("Moondream2 assets are not installed; vision remains unavailable.")
+            return True
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8081/v1/models", timeout=2) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        if not server_path:
+            self._log("No bundled llama.cpp runtime found for the Moondream2 vision server.")
+            return False
+        try:
+            self._log("Starting local Moondream2 vision server...")
+            self.processes["vision_server"] = subprocess.Popen(
+                [
+                    server_path, "-m", str(model_path), "--mmproj", str(mmproj_path),
+                    "--port", "8081", "--host", "127.0.0.1",
+                    "--no-mmproj-offload", "-ngl", "20", "-c", "2048",
+                ],
+                cwd=str(self.root),
+                creationflags=0x08000000 if sys.platform == "win32" else 0,
+            )
+            self._log(f"Moondream2 vision server started (PID: {self.processes['vision_server'].pid})")
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if self.processes["vision_server"].poll() is not None:
+                    self._log("Moondream2 vision server exited before becoming ready.")
+                    return False
+                try:
+                    with urllib.request.urlopen(
+                        "http://127.0.0.1:8081/v1/models",
+                        timeout=2,
+                    ) as response:
+                        if response.status == 200:
+                            self._log("Moondream2 vision server is ready.")
+                            return True
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    time.sleep(1)
+            self._log("Timed out waiting for Moondream2 vision server readiness.")
+            return False
+        except Exception as error:
+            self._log(f"Failed to start Moondream2 vision server: {error}")
+            return False
 
     def ensure_models(self, post_callback=None):
         """Ensure Qwen3 AI model is downloaded and ready."""
@@ -166,21 +257,48 @@ class ProcessManager:
         """Compatibility wrapper expected by launcher."""
         return self.ensure_models(post_callback=post_callback)
 
-    def _load_env(self):
-        """Load .env values into process env (best effort)."""
+    def _load_env(self, require_api_key: bool = False):
+        """Load the authoritative .env values for all supervised child processes."""
         env_file = self.root / ".env"
         if not env_file.exists():
+            os.environ.pop("NIKOLA_API_KEY", None)
+            if require_api_key:
+                raise RuntimeError(f"Required API configuration file is missing: {env_file}")
             return
 
-        try:
-            for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                os.environ[key.strip()] = value.strip()
-        except Exception:
-            pass
+        content = env_file.read_text(encoding="utf-8")
+        parsed_values = {}
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+            if not match:
+                continue
+            key, value = match.groups()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            if key == "NIKOLA_API_KEY":
+                value = value.strip()
+            parsed_values[key] = value
+
+        api_key = parsed_values.get("NIKOLA_API_KEY", "").strip()
+        if not api_key:
+            os.environ.pop("NIKOLA_API_KEY", None)
+            if require_api_key:
+                raise RuntimeError(
+                    f"NIKOLA_API_KEY must be configured in {env_file} before starting services."
+                )
+        os.environ.update(parsed_values)
+        if api_key:
+            fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+            self._log(
+                "Loaded API key from .env "
+                f"(length={len(api_key)}, sha256_prefix={fingerprint}); "
+                "managed children inherit this same environment."
+            )
 
     def restart_backend(self):
         """Restart backend service."""
@@ -241,8 +359,6 @@ class ProcessManager:
         if existing and existing.poll() is None:
             self._log("Backend is already managed and running.")
             return True
-        self._kill_port_8000()
-        
         python_exe = self._find_venv_python("backend")
         backend_dir = self.root / "backend"
         
@@ -375,7 +491,7 @@ class ProcessManager:
     
     def stop_all(self):
         """Stop all services."""
-        for service in ['electron', 'telegram', 'backend']:
+        for service in ['electron', 'telegram', 'backend', 'vision_server', 'llama_server']:
             proc = self.processes.get(service)
             if proc:
                 try:
@@ -387,7 +503,6 @@ class ProcessManager:
                     except Exception:
                         pass
         
-        self._kill_port_8000()
         self.watchdog_active = False
     
     def get_status(self):

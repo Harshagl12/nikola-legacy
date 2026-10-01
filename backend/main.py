@@ -9,10 +9,12 @@ import sys
 import time
 import json
 import base64
+import re
+import uuid
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 from concurrent.futures import ThreadPoolExecutor
 
 _project_root = str(Path(__file__).resolve().parent.parent)
@@ -22,8 +24,6 @@ sys.path[:] = [
     if Path(entry or os.curdir).resolve() != _project_root_path
 ]
 
-from PIL import ImageGrab
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +32,13 @@ from starlette.types import Message
 from backend.config import settings
 from backend.logger import get_logger
 from backend.auth import require_api_key
+from backend.application_actions import (
+    ApplicationPlan,
+    action_start_message,
+    action_status_message,
+    execute_application_plan,
+    parse_application_command,
+)
 from backend.models import (
     AskRequest, AskResponse,
     IndexRequest, IndexResponse,
@@ -47,16 +54,8 @@ from backend.models import (
     ModelListResponse, SwitchModelRequest, SwitchModelResponse, ModelDownloadRequest
     , MemoryWriteRequest, MemoryQueryRequest
 )
-from backend.rag import RAGPipeline
-from backend.autofill import AutofillEngine
-from backend.voice_engine import VoiceEngine
-from backend.voice_service import transcribe_audio, synthesize_speech, validate_audio
-from backend.nl_processor import NLProcessor
 from backend import file_browser
-from backend.workflow_memory import WorkflowMemory
 from backend.intent_confidence import IntentClassifier
-from backend.self_healing import SelfHealingAgent
-from backend.profile_learner import ProfileLearner
 from backend.capabilities import (
     EVIDENCE_UNAVAILABLE,
     answer_capability_question,
@@ -84,25 +83,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-rag = RAGPipeline(settings.CHROMA_PATH, settings.VAULT_PATH)
-autofill = AutofillEngine()
-nl = NLProcessor()
-workflow_mem = WorkflowMemory()
+rag: Any = None
+autofill: Any = None
+nl: Any = None
+workflow_mem: Any = None
 classifier = IntentClassifier()
-healer = SelfHealingAgent(nl, rag)
-learner = ProfileLearner(autofill)
-voice_engine: Optional[VoiceEngine] = None
+healer: Any = None
+learner: Any = None
+voice_engine: Any = None
+vision_engine: Any = None
 conversation_history: dict[str, list] = {}
 startup_time = time.time()
 runtime_state = {
     "backend": "BACKEND_STARTING",
     "model": "MODEL_LOADING",
     "rag": "RAG_LOADING",
+    "voice": "VOICE_LOADING",
+    "autofill": "AUTOFILL_LOADING",
+    "commands": "COMMANDS_LOADING",
+    "workflows": "WORKFLOWS_LOADING",
     "vision": "VISION_UNAVAILABLE",
     "error": None,
     "error_type": None,
     "error_detail": None,
+    "errors": {},
 }
+last_application_action: dict[str, Any] | None = None
+_initialization_task: Optional[asyncio.Task] = None
+_services_scheduled = False
 request_metrics = {
     "count": 0,
     "errors": 0,
@@ -134,52 +142,286 @@ def _debug_prompt_text(text: str) -> str:
     return redacted[:12000]
 
 
+def _is_screen_analysis_request(text: str) -> bool:
+    """Recognize explicit screen-analysis commands without catching questions."""
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    normalized = re.sub(r"^(?:hey\s+)?nikola[\s,.:!-]*", "", normalized)
+    return bool(re.match(
+        r"^(?:analy[sz]e|describe|check|read|inspect|look at)\s+"
+        r"(?:(?:my|the)\s+)?(?:current\s+)?screen\b"
+        r"|^what(?:'s| is)\s+(?:on|in)\s+(?:(?:my|the)\s+)?screen\b"
+        r"|^what can you see on (?:my|the) screen\b",
+        normalized,
+    ))
+
+
+def _is_document_search_request(text: str) -> bool:
+    """Route explicit document-vault searches through existing RAG."""
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    normalized = re.sub(r"^(?:hey\s+)?nikola[\s,.:!-]*", "", normalized)
+    return bool(re.match(
+        r"^(?:search|find|look for)\s+"
+        r"(?:(?:my|the)\s+)?(?:documents?|files?|document vault|vault)\b",
+        normalized,
+    ))
+
+
+def _record_service_failure(name: str, error: Exception) -> None:
+    """Record an optional service failure without taking down the API listener."""
+    state_key = "commands" if name == "commands" else name
+    runtime_state[state_key] = f"{name.upper()}_ERROR"
+    runtime_state["errors"][name] = str(error)
+    if name == "model":
+        runtime_state["error"] = "Local model unavailable. Check backend/backend.log."
+        runtime_state["error_type"] = "model_load_failure"
+        runtime_state["error_detail"] = str(error)
+    logger.error(f"{name.capitalize()} initialization failed", error=str(error))
+
+
+def _begin_application_action(plan: ApplicationPlan, source: str) -> str:
+    global last_application_action
+    action_id = uuid.uuid4().hex
+    last_application_action = {
+        "id": action_id,
+        "state": "running",
+        "message": action_start_message(plan),
+        "source": source,
+        "updated_at": time.time(),
+    }
+    return action_id
+
+
+def _finish_application_action(
+    action_id: str,
+    result: dict[str, Any],
+    answer: str,
+    action_state: str,
+) -> None:
+    global last_application_action
+    if last_application_action and last_application_action.get("id") == action_id:
+        last_application_action = {
+            **last_application_action,
+            "state": action_state,
+            "message": answer,
+            "result": result,
+            "updated_at": time.time(),
+        }
+
+
+async def _run_application_plan(
+    plan: ApplicationPlan,
+    source: str,
+    route_started: float,
+    action_id: str | None = None,
+) -> tuple[str, dict[str, Any], str, str]:
+    action_id = action_id or _begin_application_action(plan, source)
+    try:
+        result = await asyncio.to_thread(execute_application_plan, plan)
+    except Exception:
+        _finish_application_action(
+            action_id,
+            {"success": False, "code": "ACTION_FAILED"},
+            "Nikola couldn't complete the application action.",
+            "failed",
+        )
+        raise
+    answer = action_status_message(result)
+    action_state = (
+        "needs_clarification"
+        if result.get("code") == "AMBIGUOUS_APPLICATION"
+        else "succeeded" if result.get("success") else "failed"
+    )
+    _finish_application_action(action_id, result, answer, action_state)
+    logger.info(
+        "Application command routed",
+        source=source,
+        action_state=action_state,
+        routing_to_result_ms=round((time.perf_counter() - route_started) * 1000, 1),
+    )
+    return action_id, result, answer, action_state
+
+
+async def _initialize_rag() -> None:
+    global rag, healer
+    try:
+        from backend.rag import RAGPipeline
+
+        def build_pipeline():
+            pipeline = RAGPipeline(settings.CHROMA_PATH, settings.VAULT_PATH)
+            pipeline.start_watchdog()
+            pipeline.store.count()
+            return pipeline
+
+        rag = await asyncio.to_thread(build_pipeline)
+        runtime_state["rag"] = "RAG_READY"
+        runtime_state["errors"].pop("rag", None)
+        logger.info("RAG initialized")
+        if nl is not None:
+            await _initialize_healer()
+    except Exception as error:
+        _record_service_failure("rag", error)
+
+
+async def _initialize_model() -> None:
+    try:
+        from backend.llm_engine import get_llm
+
+        llm = await asyncio.to_thread(get_llm)
+        if not llm.is_ready():
+            error = getattr(llm, "runtime_error", None)
+            raise RuntimeError(error["detail"] if error else "The configured local model could not be initialized")
+        runtime_state["model"] = "MODEL_READY"
+        runtime_state["errors"].pop("model", None)
+    except Exception as error:
+        _record_service_failure("model", error)
+
+
+async def _initialize_voice() -> None:
+    global voice_engine
+    if not settings.VOICE_ENABLED:
+        runtime_state["voice"] = "VOICE_DISABLED"
+        return
+    try:
+        from backend.voice_engine import VoiceEngine
+
+        voice_engine = await asyncio.to_thread(VoiceEngine, settings.BACKEND_URL)
+        voice_engine.start(asyncio.get_running_loop())
+        runtime_state["voice"] = "VOICE_READY"
+    except Exception as error:
+        _record_service_failure("voice", error)
+
+
+async def _initialize_autofill() -> None:
+    global autofill, learner
+    try:
+        from backend.autofill import AutofillEngine
+        from backend.profile_learner import ProfileLearner
+
+        autofill = await asyncio.to_thread(AutofillEngine)
+        learner = await asyncio.to_thread(ProfileLearner, autofill)
+        runtime_state["autofill"] = "AUTOFILL_READY"
+    except Exception as error:
+        _record_service_failure("autofill", error)
+
+
+async def _initialize_commands() -> None:
+    global nl
+    try:
+        from backend.nl_processor import NLProcessor
+
+        nl = await asyncio.to_thread(NLProcessor)
+        runtime_state["commands"] = "COMMANDS_READY"
+        if rag is not None:
+            await _initialize_healer()
+    except Exception as error:
+        _record_service_failure("commands", error)
+
+
+async def _initialize_workflows() -> None:
+    global workflow_mem
+    try:
+        from backend.workflow_memory import WorkflowMemory
+
+        workflow_mem = await asyncio.to_thread(WorkflowMemory)
+        runtime_state["workflows"] = "WORKFLOWS_READY"
+    except Exception as error:
+        _record_service_failure("workflows", error)
+
+
+async def _initialize_vision() -> None:
+    """Load and verify Moondream2 through the local vision server."""
+    global vision_engine
+    try:
+        from backend.vision_engine import VisionEngine
+
+        engine = await asyncio.to_thread(VisionEngine)
+        if not await asyncio.to_thread(engine.is_ready):
+            missing = [
+                str(path)
+                for path in (engine.model_path, engine.mmproj_path)
+                if not path.is_file()
+            ]
+            detail = (
+                f"Moondream2 assets are missing: {', '.join(missing)}"
+                if missing
+                else "Moondream2 vision server is not ready."
+            )
+            raise RuntimeError(detail)
+        probe_image = await asyncio.to_thread(_get_screenshot_base64)
+        probe_answer = await asyncio.to_thread(engine.verify_inference, probe_image)
+        if not probe_answer.strip():
+            raise RuntimeError("Moondream2 verification inference returned an empty response")
+        vision_engine = engine
+        runtime_state["vision"] = "VISION_READY"
+        runtime_state["errors"].pop("vision", None)
+        logger.info("Moondream2 vision server is reachable")
+    except Exception as error:
+        vision_engine = None
+        _record_service_failure("vision", error)
+
+
+async def _initialize_healer() -> None:
+    global healer
+    if nl is None or rag is None:
+        return
+    try:
+        from backend.self_healing import SelfHealingAgent
+
+        healer = await asyncio.to_thread(SelfHealingAgent, nl, rag)
+    except Exception as error:
+        runtime_state["errors"]["healer"] = str(error)
+        logger.error("Self-healing agent initialization failed", error=str(error))
+
+
+async def _initialize_services() -> None:
+    # Let Uvicorn finish creating the listener before importing optional,
+    # potentially slow services.
+    await asyncio.sleep(0.25)
+    await asyncio.gather(
+        _initialize_rag(),
+        _initialize_model(),
+        _initialize_voice(),
+        _initialize_autofill(),
+        _initialize_commands(),
+        _initialize_workflows(),
+        _initialize_vision(),
+    )
+
+
+def _schedule_service_initialization() -> None:
+    global _initialization_task, _services_scheduled
+    if not _services_scheduled:
+        _services_scheduled = True
+        _initialization_task = asyncio.create_task(_initialize_services())
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Startup: initialize RAG, voice engine, and models."""
-    global voice_engine
-    
-    runtime_state["backend"] = "BACKEND_STARTING"
+    """Mark the API listener live and defer service initialization."""
+    global _services_scheduled
+    _services_scheduled = False
+    runtime_state["backend"] = "BACKEND_READY"
     runtime_state["error"] = None
     runtime_state["error_type"] = None
     runtime_state["error_detail"] = None
-    try:
-        # Start RAG watchdog
-        rag.start_watchdog()
-        rag.store.count()
-        runtime_state["rag"] = "RAG_READY"
-        logger.info("RAG watchdog started")
-        
-        # Initialize voice engine if enabled
-        if settings.VOICE_ENABLED:
-            voice_engine = VoiceEngine(settings.BACKEND_URL)
-            loop = asyncio.get_event_loop()
-            voice_engine.start(loop)
-            logger.info("Voice engine started")
 
-        # Readiness means the model has really been initialized, not merely that
-        # a GGUF file exists. This deliberately happens before Electron is told
-        # that Nikola is ready.
-        from backend.llm_engine import get_llm
-        llm = await loop.run_in_executor(executor, get_llm)
-        if not llm.is_ready():
-            error = getattr(llm, "runtime_error", None)
-            if error:
-                runtime_state["error_type"] = error["type"]
-                runtime_state["error_detail"] = error["detail"]
-                raise RuntimeError(error["detail"])
-            raise RuntimeError("The configured local model could not be initialized")
-        runtime_state["model"] = "MODEL_READY"
-        runtime_state["backend"] = "BACKEND_READY"
-    except Exception as e:
-        runtime_state["backend"] = "BACKEND_ERROR"
-        if runtime_state["rag"] != "RAG_READY":
-            runtime_state["rag"] = "RAG_ERROR"
-        runtime_state["model"] = "MODEL_ERROR"
-        runtime_state["error"] = "Local model initialization failed. Check Nikola logs."
-        runtime_state.setdefault("error_type", "unknown_runtime_error")
-        runtime_state.setdefault("error_detail", str(e))
-        logger.error("Startup failed", error=str(e))
+
+def _require_service(service: str, instance: Any) -> Any:
+    if instance is None:
+        _schedule_service_initialization()
+        state = runtime_state.get(service, "SERVICE_UNAVAILABLE")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "SERVICE_UNAVAILABLE",
+                "service": service,
+                "state": state,
+                "message": runtime_state["errors"].get(
+                    service, f"The local {service} service is not ready."
+                ),
+            },
+        )
+    return instance
 
 
 @app.on_event("shutdown")
@@ -190,17 +432,26 @@ async def shutdown_event():
     if voice_engine:
         voice_engine.stop()
     
-    rag.stop_watchdog()
+    if rag is not None:
+        rag.stop_watchdog()
+    if _initialization_task and not _initialization_task.done():
+        _initialization_task.cancel()
     logger.info("Backend shutdown")
 
 
 @app.get("/health", dependencies=[])
 async def health_check():
     """Health check endpoint for launcher and monitoring."""
-    return {"status": "ok", "timestamp": time.time(), "backend": runtime_state["backend"]}
+    _schedule_service_initialization()
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "backend": runtime_state["backend"],
+        "pid": os.getpid(),
+    }
 
 
-@app.get("/api/status", dependencies=[])
+@app.get("/api/status")
 async def api_status():
     """Status endpoint."""
     return {
@@ -216,10 +467,83 @@ async def api_status():
 @app.post("/ask", response_model=None)
 async def ask(request: AskRequest):
     """Ask a question with optional RAG context."""
+    route_started = time.perf_counter()
+    conv_id = request.conversation_id or f"conv_{int(time.time())}"
+    application_plan = parse_application_command(request.query)
+    if application_plan is not None:
+        if request.stream:
+            action_id = _begin_application_action(application_plan, request.source)
+
+            async def stream_application_action():
+                yield f"data: {json.dumps({'event': 'action_start', 'action_id': action_id, 'source': request.source, 'message': action_start_message(application_plan), 'action_plan': [{'action': step.action, 'application': step.application, 'url': step.url} for step in application_plan.steps]})}\n\n"
+                result_action_id, result, answer, action_state = await _run_application_plan(
+                    application_plan,
+                    request.source,
+                    route_started,
+                    action_id,
+                )
+                if result.get("success") and workflow_mem is not None:
+                    workflow_mem.log_action("application_action", request.query[:120])
+                conversation_history.setdefault(conv_id, []).extend([
+                    {"role": "user", "content": request.query},
+                    {"role": "assistant", "content": answer},
+                ])
+                yield f"data: {json.dumps({'event': 'complete', 'action_id': result_action_id, 'source': request.source, 'answer': answer, 'sources': [], 'conversation_id': conv_id, 'action_result': result, 'action_state': action_state})}\n\n"
+
+            return StreamingResponse(
+                stream_application_action(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        action_id, result, answer, action_state = await _run_application_plan(
+            application_plan,
+            request.source,
+            route_started,
+        )
+        if result.get("success") and workflow_mem is not None:
+            workflow_mem.log_action("application_action", request.query[:120])
+        conversation_history.setdefault(conv_id, []).extend([
+            {"role": "user", "content": request.query},
+            {"role": "assistant", "content": answer},
+        ])
+        return AskResponse(
+            answer=answer,
+            sources=[],
+            conversation_id=conv_id,
+            action_result=result,
+            action_state=action_state,
+            action_id=action_id,
+        )
+
+    if _is_screen_analysis_request(request.query):
+        if request.stream:
+            async def stream_screen_analysis():
+                yield f"data: {json.dumps({'event': 'screen_analysis_start', 'message': 'Analyzing your screen locally...'})}\n\n"
+                screen = await solve_screen(ScreenRequest(query=request.query))
+                answer = f"{screen.description}\n\n{screen.solution}"
+                yield f"data: {json.dumps({'event': 'complete', 'answer': answer, 'sources': [], 'conversation_id': conv_id, 'workflow': 'screen_analysis'})}\n\n"
+
+            return StreamingResponse(
+                stream_screen_analysis(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        screen = await solve_screen(ScreenRequest(query=request.query))
+        answer = f"{screen.description}\n\n{screen.solution}"
+        return AskResponse(
+            answer=answer,
+            sources=[],
+            conversation_id=conv_id,
+            action_result=screen.model_dump(),
+        )
+
+    use_rag = request.use_rag or _is_document_search_request(request.query)
+    pipeline = _require_service("rag", rag) if use_rag else None
+    if runtime_state["model"] != "MODEL_READY":
+        _require_service("model", None)
     try:
         # Generate conversation ID if needed
-        conv_id = request.conversation_id or f"conv_{int(time.time())}"
-        
         # Get conversation history (last 10 turns)
         history = conversation_history.get(conv_id, [])[-10:]
         
@@ -252,9 +576,9 @@ async def ask(request: AskRequest):
             if message.get("role") in {"user", "assistant"}
         ]
         
-        if request.use_rag:
+        if use_rag:
             # Get RAG context
-            chunks, filenames = await rag.query(request.query)
+            chunks, filenames = await pipeline.query(request.query)
             context = "\n\n".join(chunks[:5])
 
             if context:
@@ -267,7 +591,7 @@ async def ask(request: AskRequest):
         else:
             filenames = []
 
-        if request.use_rag and not context:
+        if use_rag and not context:
             logger.info("Grounding refused: no relevant evidence", query=request.query[:80])
             return AskResponse(
                 answer=EVIDENCE_UNAVAILABLE,
@@ -279,8 +603,8 @@ async def ask(request: AskRequest):
             logger.debug(
                 "Chat request prepared",
                 query=_debug_prompt_text(request.query),
-                route="rag" if request.use_rag else "chat",
-                rag_activated=bool(request.use_rag and filenames),
+                route="rag" if use_rag else "chat",
+                rag_activated=bool(use_rag and filenames),
                 retrieved_document_ids=filenames,
                 system_prompt=_debug_prompt_text(system_prompt),
                 history_messages=len(history_for_prompt),
@@ -309,7 +633,7 @@ async def ask(request: AskRequest):
                             break
                         pieces.append(token)
                 finally:
-                    answer, grounding = verify_answer("".join(pieces), chunks if request.use_rag else []) if request.use_rag else ("".join(pieces), {"supported": True, "rejected_claims": 0})
+                    answer, grounding = verify_answer("".join(pieces), chunks if use_rag else []) if use_rag else ("".join(pieces), {"supported": True, "rejected_claims": 0})
                     if answer:
                         conversation_history.setdefault(conv_id, []).extend([
                             {"role": "user", "content": request.query},
@@ -343,7 +667,7 @@ async def ask(request: AskRequest):
         
         response = await generate_response()
         answer = response["choices"][0]["message"]["content"]
-        if request.use_rag:
+        if use_rag:
             answer, grounding = verify_answer(answer, chunks)
             logger.info("Grounding verification complete", supported=grounding["supported"], rejected_claims=grounding["rejected_claims"])
 
@@ -359,7 +683,8 @@ async def ask(request: AskRequest):
         
         logger.info("Question answered", query=request.query[:50], conv_id=conv_id)
         
-        workflow_mem.log_action('ask', request.query[:120])
+        if workflow_mem is not None:
+            workflow_mem.log_action('ask', request.query[:120])
         
         return AskResponse(
             answer=answer,
@@ -367,6 +692,8 @@ async def ask(request: AskRequest):
             conversation_id=conv_id
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Ask failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -400,55 +727,64 @@ def _get_screen_text_context() -> str:
 
 @app.post("/solve-screen", response_model=None)
 async def solve_screen(request: Optional[ScreenRequest] = None):
-    """Analyze current screen / active window context to diagnose and solve issues."""
+    """Analyze the current screen only through a verified local vision service."""
+    if runtime_state["vision"] != "VISION_READY":
+        _schedule_service_initialization()
+        detail = runtime_state["errors"].get(
+            "vision",
+            "Vision is currently unavailable because the local Moondream2 model is not ready.",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "VISION_UNAVAILABLE",
+                "message": "Vision is currently unavailable. No image analysis was performed.",
+                "reason": detail,
+            },
+        )
     try:
         query = request.query if (request and request.query) else "Analyze this screen and diagnose potential issues."
-        from backend.llm_engine import get_llm
-        llm = get_llm()
+        if vision_engine is None:
+            raise RuntimeError("Moondream2 vision service is not initialized")
         loop = asyncio.get_event_loop()
-        
-        if getattr(llm, "supports_vision", False):
-            try:
-                def grab_img():
-                    img = ImageGrab.grab()
-                    buf = BytesIO()
-                    img.save(buf, format="JPEG", quality=80)
-                    return base64.b64encode(buf.getvalue()).decode("utf-8")
-                img_b64 = await loop.run_in_executor(executor, grab_img)
-                sol = await loop.run_in_executor(executor, lambda: llm.vision_infer(img_b64, query))
-                return SolveScreenResponse(
-                    description="Vision screenshot analysis",
-                    solution=sol,
-                    timestamp=datetime.utcnow().isoformat()
-                )
-            except Exception as e:
-                logger.warning("Vision infer failed, falling back to text context", error=str(e))
-                
-        context_str = await loop.run_in_executor(executor, _get_screen_text_context)
-        sol = await loop.run_in_executor(executor, lambda: llm.text_infer(context_str, query))
-        description = f"Current State: {context_str.splitlines()[0] if context_str else 'Desktop active'}"
-        
-        logger.info("Screen diagnosed successfully via context")
-        
-        return SolveScreenResponse(
-            description=description,
-            solution=sol.strip() if isinstance(sol, str) else str(sol),
-            timestamp=datetime.utcnow().isoformat()
+
+        img_b64 = request.screenshot_base64 if request and request.screenshot_base64 else await loop.run_in_executor(
+            executor,
+            _get_screenshot_base64,
         )
-    
+        if not img_b64:
+            raise RuntimeError("Screen capture returned no image data")
+        sol = await loop.run_in_executor(executor, lambda: vision_engine.infer(img_b64, query))
+        if not isinstance(sol, str) or not sol.strip():
+            raise RuntimeError("Vision model returned an empty response")
+        return SolveScreenResponse(
+            description="Vision screenshot analysis",
+            solution=sol.strip(),
+            timestamp=datetime.utcnow().isoformat(),
+        )
     except TimeoutError:
         logger.error("Solve screen timed out")
         raise HTTPException(status_code=504, detail="Screen analysis timed out")
     except Exception as e:
         logger.error("Solve screen failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        runtime_state["vision"] = "VISION_ERROR"
+        runtime_state["errors"]["vision"] = str(e)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "VISION_INFERENCE_FAILED",
+                "message": "Vision analysis failed. No text-only fallback was used.",
+                "reason": str(e),
+            },
+        )
 
 
 @app.post("/index", response_model=IndexResponse)
 async def index_file(request: IndexRequest) -> IndexResponse:
     """Index a single file."""
+    pipeline = _require_service("rag", rag)
     try:
-        result = await rag.index_file(request.file_path)
+        result = await pipeline.index_file(request.file_path)
         
         return IndexResponse(
             success=result.get("success", False),
@@ -468,8 +804,9 @@ async def remove_file(request: RemoveRequest) -> RemoveResponse:
     """Remove file from RAG."""
     if not request.confirm:
         raise HTTPException(status_code=400, detail="Confirmation required")
+    pipeline = _require_service("rag", rag)
     try:
-        chunks_deleted = await rag.remove_file(request.filename)
+        chunks_deleted = await pipeline.remove_file(request.filename)
         
         return RemoveResponse(
             ok=True,
@@ -487,9 +824,10 @@ async def clear_all(request: ClearAllRequest) -> ClearAllResponse:
     """Clear all RAG data."""
     if not request.confirm:
         raise HTTPException(status_code=400, detail="Confirmation required")
+    pipeline = _require_service("rag", rag)
     
     try:
-        chunks_deleted, files_removed = await rag.clear_all()
+        chunks_deleted, files_removed = await pipeline.clear_all()
         
         # Clear conversation history
         conversation_history.clear()
@@ -510,8 +848,9 @@ async def clear_all(request: ClearAllRequest) -> ClearAllResponse:
 @app.get("/rag/files")
 async def get_rag_files() -> dict:
     """Get list of indexed files."""
+    pipeline = _require_service("rag", rag)
     try:
-        files = rag.get_files()
+        files = pipeline.get_files()
         
         return {
             "files": files,
@@ -573,16 +912,19 @@ async def download_model_endpoint(request: ModelDownloadRequest):
 async def status() -> StatusResponse:
     """Get system status."""
     try:
-        files = rag.get_files()
+        files = rag.get_files() if rag is not None else []
         indexed_files = len(files)
         collection_size = sum(f.get("chunks", 0) for f in files)
         
-        try:
-            from backend.llm_engine import LLMEngine
-            _, active_model = LLMEngine.list_models()
-            models_loaded = [active_model]
-        except Exception:
-            models_loaded = ["Qwen3-1.7B-Q4_K_M.gguf"]
+        models_loaded = []
+        if runtime_state["model"] == "MODEL_READY":
+            try:
+                from backend.llm_engine import LLMEngine
+
+                _, active_model = LLMEngine.list_models()
+                models_loaded = [active_model]
+            except Exception as error:
+                logger.warning("Could not list the initialized local model", error=str(error))
 
             
         uptime = time.time() - startup_time
@@ -592,6 +934,22 @@ async def status() -> StatusResponse:
             collection_size=collection_size,
             models_loaded=models_loaded,
             voice_active=bool(voice_engine and getattr(voice_engine, "_running", False)),
+            voice_state=runtime_state["voice"],
+            microphone_state=(
+                voice_engine.microphone_state
+                if voice_engine is not None
+                else "MICROPHONE_UNAVAILABLE"
+            ),
+            microphone_device=(
+                voice_engine.microphone_device
+                if voice_engine is not None
+                else None
+            ),
+            wake_word=(
+                voice_engine.wake_word
+                if voice_engine is not None
+                else None
+            ),
             uptime_seconds=uptime,
             backend_state=runtime_state["backend"],
             model_state=runtime_state["model"],
@@ -603,6 +961,7 @@ async def status() -> StatusResponse:
             average_latency_ms=round(
                 request_metrics["latency_total_ms"] / request_metrics["count"], 2
             ) if request_metrics["count"] else 0.0,
+            service_errors=dict(runtime_state["errors"]),
         )
     
     except Exception as e:
@@ -615,15 +974,15 @@ async def status() -> StatusResponse:
 @app.post("/voice-speak")
 async def voice_speak(request: VoiceSpeakRequest) -> dict:
     """Trigger voice TTS."""
+    engine = _require_service("voice", voice_engine)
     try:
-        if not voice_engine:
-            raise HTTPException(status_code=400, detail="Voice engine not enabled")
-        
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(executor, voice_engine.speak, request.text)
+        await loop.run_in_executor(executor, engine.speak, request.text)
         
         return {"ok": True}
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Voice speak failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -632,7 +991,11 @@ async def voice_speak(request: VoiceSpeakRequest) -> dict:
 @app.post("/voice/transcribe", response_model=VoiceTranscribeResponse)
 async def transcribe_audio_endpoint(file: UploadFile = File(...)) -> VoiceTranscribeResponse:
     """Transcribe audio file."""
+    if runtime_state["voice"] != "VOICE_READY":
+        _require_service("voice", None)
     try:
+        from backend.voice_service import transcribe_audio
+
         audio_bytes = await file.read()
         
         result = await transcribe_audio(audio_bytes)
@@ -653,8 +1016,9 @@ async def transcribe_audio_endpoint(file: UploadFile = File(...)) -> VoiceTransc
 @app.get("/autofill/profile")
 async def get_autofill_profile() -> dict:
     """Get profile field names ONLY (never values)."""
+    engine = _require_service("autofill", autofill)
     try:
-        fields = autofill.get_field_names()
+        fields = engine.get_field_names()
         
         return {"fields": fields}
     
@@ -666,8 +1030,9 @@ async def get_autofill_profile() -> dict:
 @app.post("/autofill/profile")
 async def add_autofill_field(field: str, value: str) -> dict:
     """Add profile field."""
+    engine = _require_service("autofill", autofill)
     try:
-        fields_count = autofill.add_field(field, value)
+        fields_count = engine.add_field(field, value)
         
         return {"ok": True, "fields_count": fields_count}
     
@@ -679,10 +1044,11 @@ async def add_autofill_field(field: str, value: str) -> dict:
 @app.post("/autofill/fill", response_model=AutofillFillResponse)
 async def fill_autofill(request: dict) -> AutofillFillResponse:
     """Map and fill form fields."""
+    engine = _require_service("autofill", learner)
     try:
         form_fields = request.get("form_fields", [])
         
-        result = await learner.suggest_from_learned(form_fields)
+        result = await engine.suggest_from_learned(form_fields)
         
         return AutofillFillResponse(
             mappings=result.get("mappings", {}),
@@ -698,8 +1064,9 @@ async def fill_autofill(request: dict) -> AutofillFillResponse:
 @app.post("/autofill/clear")
 async def clear_autofill() -> dict:
     """Clear autofill profile."""
+    engine = _require_service("autofill", autofill)
     try:
-        autofill.clear()
+        engine.clear()
         
         return {"ok": True}
     
@@ -709,7 +1076,8 @@ async def clear_autofill() -> dict:
 
 @app.post("/autofill/correction")
 async def autofill_correction(request: dict):
-    learner.log_correction(
+    engine = _require_service("autofill", learner)
+    engine.log_correction(
         request.get("field_label"),
         request.get("field_type"),
         request.get("field_placeholder"),
@@ -721,7 +1089,8 @@ async def autofill_correction(request: dict):
 
 @app.get("/autofill/learning-stats")
 async def get_learning_stats():
-    return learner.get_learning_stats()
+    engine = _require_service("autofill", learner)
+    return engine.get_learning_stats()
 
 
 # === Natural Language Endpoints ===
@@ -751,11 +1120,37 @@ async def execute_validated_tool(request: ToolRequest) -> dict:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, execute_tool, request)
 
+
+@app.get("/actions/recent")
+async def get_recent_application_action() -> dict:
+    """Expose the latest safe application-action state to the authenticated UI."""
+    return dict(last_application_action or {})
+
+
 @app.post("/nl/command", response_model=None)
 async def nl_command(request: NLCommandRequest):
     """Process natural language command."""
+    processor = _require_service("commands", nl)
     try:
         text = request.text
+        application_plan = parse_application_command(text)
+        if application_plan is not None:
+            action_id, result, description, action_state = await _run_application_plan(
+                application_plan,
+                "text",
+                time.perf_counter(),
+            )
+            if result.get("success") and workflow_mem is not None:
+                workflow_mem.log_action("application_action", text[:120])
+            return NLCommandResponse(
+                action=result.get("action", "application_action"),
+                description=description,
+                success=result.get("success", False),
+                result=result,
+                error=result.get("error"),
+                action_id=action_id,
+                action_state=action_state,
+            )
         if request.stream:
             from backend.llm_engine import get_llm
             llm = get_llm()
@@ -777,13 +1172,14 @@ async def nl_command(request: NLCommandRequest):
             )
             
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, nl.process_command, text)
+        result = await loop.run_in_executor(executor, processor.process_command, text)
         
         if result.get('success') == False:
             top_intent = top['intent']
-            result = await healer.execute_with_healing(text, top_intent, result)
+            if healer is not None:
+                result = await healer.execute_with_healing(text, top_intent, result)
             
-        if result.get('success'):
+        if result.get('success') and workflow_mem is not None:
             workflow_mem.log_action(result.get('action', 'unknown'), text)
             
         return NLCommandResponse(
@@ -798,22 +1194,44 @@ async def nl_command(request: NLCommandRequest):
             confidence=top['confidence']
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("NL command failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/nl/execute-intent", response_model=NLCommandResponse)
 async def execute_intent(request: dict):
+    processor = _require_service("commands", nl)
     try:
         text = request.get("query")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(status_code=422, detail="A natural-language query is required.")
+        application_plan = parse_application_command(text)
+        if application_plan is not None:
+            action_id, result, description, action_state = await _run_application_plan(
+                application_plan,
+                "text",
+                time.perf_counter(),
+            )
+            return NLCommandResponse(
+                action=result.get("action", "application_action"),
+                description=description,
+                success=result.get("success", False),
+                result=result,
+                error=result.get("error"),
+                action_id=action_id,
+                action_state=action_state,
+            )
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, nl.process_command, text)
+        result = await loop.run_in_executor(executor, processor.process_command, text)
         
         if result.get('success') == False:
             top_intent = request.get("chosen_intent", "unknown")
-            result = await healer.execute_with_healing(text, top_intent, result)
+            if healer is not None:
+                result = await healer.execute_with_healing(text, top_intent, result)
             
-        if result.get('success'):
+        if result.get('success') and workflow_mem is not None:
             workflow_mem.log_action(result.get('action', 'unknown'), text)
             
         return NLCommandResponse(
@@ -826,31 +1244,39 @@ async def execute_intent(request: dict):
             healing_explanation=result.get("healing_explanation"),
             healing_log=result.get("healing_log")
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Execute intent failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/workflow/suggestion")
 async def get_workflow_suggestion():
-    return workflow_mem.get_pending_suggestion()
+    store = _require_service("workflows", workflow_mem)
+    return store.get_pending_suggestion()
 
 @app.post("/workflow/confirm")
 async def confirm_workflow(request: dict):
-    workflow_mem.confirm_workflow(request.get("pattern_hash"))
+    store = _require_service("workflows", workflow_mem)
+    store.confirm_workflow(request.get("pattern_hash"))
     return {"ok": True}
 
 @app.post("/workflow/execute")
 async def execute_workflow(request: dict):
-    results = workflow_mem.execute_workflow(request.get("pattern_hash"), nl)
+    processor = _require_service("commands", nl)
+    store = _require_service("workflows", workflow_mem)
+    results = store.execute_workflow(request.get("pattern_hash"), processor)
     return {"ok": True, "results": results}
 
 @app.get("/workflow/list")
 async def list_workflows():
-    return workflow_mem.get_all_workflows()
+    store = _require_service("workflows", workflow_mem)
+    return store.get_all_workflows()
 
 @app.delete("/workflow/{hash}")
 async def delete_workflow(hash: str):
-    workflow_mem.delete_workflow(hash)
+    store = _require_service("workflows", workflow_mem)
+    store.delete_workflow(hash)
     return {"ok": True}
 
 
@@ -891,23 +1317,43 @@ def _get_screenshot_base64() -> str:
 
 @app.get("/ready")
 async def ready() -> dict:
-    """Readiness check for the launcher and desktop shell."""
-    ready_state = (
-        runtime_state["backend"] == "BACKEND_READY"
+    """Report readiness of the listener and its required local services."""
+    _schedule_service_initialization()
+    ready_state = runtime_state["backend"] == "BACKEND_READY"
+    required_services_ready = (
+        ready_state
         and runtime_state["model"] == "MODEL_READY"
         and runtime_state["rag"] == "RAG_READY"
     )
     payload = {
-        "status": "ready" if ready_state else "starting",
-        "backend": runtime_state["backend"].lower(),
-        "model": runtime_state["model"].lower(),
-        "rag": runtime_state["rag"].lower(),
-        "vision": runtime_state["vision"].lower(),
+        "status": (
+            "ready"
+            if required_services_ready
+            else "degraded"
+            if any(state.endswith("_ERROR") for state in runtime_state.values() if isinstance(state, str))
+            else "starting"
+        ),
+        "backend": runtime_state["backend"],
+        "model": runtime_state["model"],
+        "rag": runtime_state["rag"],
+        "voice": runtime_state["voice"],
+        "autofill": runtime_state["autofill"],
+        "commands": runtime_state["commands"],
+        "workflows": runtime_state["workflows"],
+        "vision": runtime_state["vision"],
         "error": runtime_state["error"],
         "error_type": runtime_state.get("error_type"),
-        "error_detail": runtime_state.get("error_detail"),
+        "error_detail": None,
+        "service_errors": {
+            name: str(detail)
+            for name in runtime_state["errors"]
+            for detail in [runtime_state["errors"][name]]
+        },
     }
-    return JSONResponse(status_code=200 if ready_state else 503, content=payload)
+    return JSONResponse(
+        status_code=200 if required_services_ready else 503,
+        content=payload,
+    )
 
 
 @app.post("/system/restart")

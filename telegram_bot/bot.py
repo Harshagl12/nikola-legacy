@@ -37,7 +37,7 @@ _allowed_raw = os.getenv("TELEGRAM_ALLOWED_USERS", str(ALLOWED_USER_ID))
 TELEGRAM_ALLOWED_USERS = set(int(u.strip()) for u in _allowed_raw.split(",") if u.strip().lstrip('-').isdigit())
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-NIKOLA_API_KEY = os.getenv("NIKOLA_API_KEY", "nikola-dev-secret-key")
+NIKOLA_API_KEY = os.getenv("NIKOLA_API_KEY", "")
 
 _original_async_client = httpx.AsyncClient
 
@@ -133,7 +133,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 f"{BACKEND_URL}/ask",
-                json={"query": query, "use_rag": True}
+                json={"query": query, "use_rag": True, "source": "telegram"}
             )
             
             if response.status_code == 200:

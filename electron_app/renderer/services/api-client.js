@@ -2,20 +2,33 @@
   'use strict';
 
   const BASE_URL = 'http://127.0.0.1:8000';
+  const SCREEN_VISION_TIMEOUT_MS = 180_000;
 
   class NikolaApiError extends Error {
-    constructor(message, status) {
+    constructor(message, status, code, details) {
       super(message);
       this.name = 'NikolaApiError';
       this.status = status || 0;
+      this.code = code || 'UNKNOWN_ERROR';
+      this.details = details || null;
     }
   }
 
-  function friendlyError(response) {
-    if (response.status === 401) return 'Nikola could not authenticate with its local backend.';
+  function friendlyError(response, payload) {
+    const detail = payload?.detail;
+    if (response.status === 401) return 'Nikola’s local backend rejected its API key.';
+    if (response.status === 403) return 'Nikola’s local backend denied this request.';
     if (response.status === 404) return 'This Nikola feature is not available in the local backend.';
+    if (response.status === 504) return 'Local vision analysis is taking longer than expected.';
+    if (response.status === 503 && detail?.service) {
+      return `${detail.service} service is ${String(detail.state || 'unavailable').toLowerCase().replaceAll('_', ' ')}.`;
+    }
+    if (response.status === 503 && detail && typeof detail === 'object') {
+      const message = detail.message || 'Local vision analysis is unavailable.';
+      return detail.reason ? `${message} ${detail.reason}` : message;
+    }
     if (response.status >= 500) return 'Nikola’s local backend could not complete that request.';
-    return 'Nikola could not complete that request.';
+    return typeof detail === 'string' ? detail : 'Nikola could not complete that request.';
   }
 
   async function request(path, options = {}) {
@@ -31,12 +44,35 @@
           ...(options.headers || {}),
         },
       });
-      if (!response.ok) throw new NikolaApiError(friendlyError(response), response.status);
+      if (!response.ok) {
+        let payload = null;
+        try { payload = await response.json(); } catch { /* Error bodies are optional. */ }
+        const detail = payload?.detail;
+        throw new NikolaApiError(
+          friendlyError(response, payload),
+          response.status,
+          detail?.code || `HTTP_${response.status}`,
+          detail
+        );
+      }
       return response;
     } catch (error) {
-      if (error.name === 'AbortError') throw error;
+      if (error.name === 'AbortError') {
+        if (controller) {
+          throw new NikolaApiError(
+            options.timeoutMessage || 'Nikola’s local backend did not respond before the request timed out.',
+            0,
+            options.timeoutCode || 'TIMEOUT'
+          );
+        }
+        throw error;
+      }
       if (error instanceof NikolaApiError) throw error;
-      throw new NikolaApiError('Unable to connect to Nikola’s local backend.');
+      throw new NikolaApiError(
+        'Unable to connect to Nikola’s local backend.',
+        0,
+        'NETWORK_ERROR'
+      );
     } finally {
       global.clearTimeout(timeout);
     }
@@ -81,14 +117,22 @@
     json,
     streamAnswer,
     error: NikolaApiError,
+    health: () => json('/health'),
     status: () => json('/status'),
+    recentApplicationAction: () => json('/actions/recent'),
     documents: () => json('/rag/files'),
     indexDocument: (filePath) => json('/index', { method: 'POST', body: JSON.stringify({ file_path: filePath }) }),
     removeDocument: (filename) => json('/rag/remove', { method: 'POST', body: JSON.stringify({ filename }) }),
     clearDocuments: () => json('/rag/clear-all', { method: 'POST', body: JSON.stringify({ confirm: true }) }),
     models: () => json('/models/list'),
     workflows: () => json('/workflow/list'),
-    solveScreen: (query) => json('/solve-screen', { method: 'POST', body: JSON.stringify({ query }) }),
+    solveScreen: (query, screenshotBase64) => json('/solve-screen', {
+      method: 'POST',
+      body: JSON.stringify({ query, screenshot_base64: screenshotBase64 || undefined }),
+      timeout: SCREEN_VISION_TIMEOUT_MS,
+      timeoutCode: 'SCREEN_VISION_TIMEOUT',
+      timeoutMessage: 'Local vision analysis is taking longer than expected.',
+    }),
     transcribe: (file) => {
       const form = new FormData();
       form.append('file', file, 'nikola-voice.webm');

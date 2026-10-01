@@ -1,9 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('../backend', 'backend'), ('../telegram_bot', 'telegram_bot'), ('../electron_app', 'electron_app'), ('../browser_extension', 'browser_extension')]
+launcher_dir = Path(SPECPATH)
+project_root = launcher_dir.parent
+datas = [
+    (str(launcher_dir / 'nikola_icon.ico'), '.'),
+    (str(project_root / 'backend'), 'backend'),
+    (str(project_root / 'telegram_bot'), 'telegram_bot'),
+    (str(project_root / 'electron_app'), 'electron_app'),
+    (str(project_root / 'browser_extension'), 'browser_extension'),
+]
 binaries = []
-hiddenimports = ['pystray._win32', 'PIL._tkinter_finder', 'win32gui']
+hiddenimports = ['pystray._win32', 'PIL._tkinter_finder', 'PIL._imaging', 'PIL.Image', 'PIL.ImageGrab', 'win32gui']
 tmp_ret = collect_all('pystray')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('PIL')
@@ -12,7 +21,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['launcher.py'],
-    pathex=[],
+    pathex=[str(project_root), str(launcher_dir)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -42,7 +51,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['nikola_icon.ico'],
-    contents_directory='.',
+    contents_directory='_internal',
 )
 coll = COLLECT(
     exe,

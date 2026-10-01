@@ -14,6 +14,11 @@
     isRecording: false,
     mediaRecorder: null,
     audioChunks: [],
+    lastApplicationActionId: null,
+    lastApplicationActionUpdatedAt: 0,
+    actionPollInFlight: false,
+    actionPollErrorLogged: false,
+    startedAt: Date.now() / 1000,
   };
 
   document.body.innerHTML = `
@@ -137,12 +142,17 @@
   }
 
   function updateSystemStatus(status) {
-    const allReady = status.backend_state === 'BACKEND_READY' && status.model_state === 'MODEL_READY' && status.rag_state === 'RAG_READY';
+    const allReady = status.backend_state === 'BACKEND_READY' && status.model_state === 'MODEL_READY';
     const headline = allReady ? 'READY' : status.model_state === 'MODEL_ERROR' ? 'MODEL ERROR' : 'INITIALIZING';
     $('#header-state').textContent = headline;
     $('#header-model').textContent = status.models_loaded?.[0] || 'Local model';
     $('#orb-status').textContent = headline;
     $('#assistant-ball').dataset.state = allReady ? 'ready' : headline === 'MODEL ERROR' ? 'error' : 'pending';
+    const microphoneState = String(status.microphone_state || 'MICROPHONE_UNKNOWN');
+    const microphoneLabel = microphoneState.replace(/^MICROPHONE_/, '').replaceAll('_', ' ').toLowerCase();
+    $('#voice-state').textContent = microphoneState === 'MICROPHONE_READY'
+      ? `Listening for “${status.wake_word || 'Nikola'}” · ${microphoneLabel}`
+      : `Microphone ${microphoneLabel}`;
     updateDot('#header-dot', headline);
     [['backend', status.backend_state], ['model', status.model_state], ['rag', status.rag_state], ['vision', status.vision_state]].forEach(([name, value]) => {
       updateDot(`#side-${name}`, value);
@@ -152,18 +162,65 @@
     });
     $('#connection-banner').classList.toggle('hidden', allReady);
     if (!allReady) $('#connection-banner').querySelector('p').textContent = status.startup_error || 'Nikola is still preparing its local services.';
-    $('#center-activity').textContent = status.startup_error || (allReady ? 'Ready for a local task.' : 'Preparing local services.');
+    const serviceErrors = Object.entries(status.service_errors || {})
+      .map(([name, error]) => `${name}: ${error}`)
+      .join(' · ');
+    $('#center-activity').textContent = status.startup_error || serviceErrors || (allReady ? 'Ready for a local task.' : 'Preparing local services.');
   }
 
   async function refreshStatus() {
     try {
+      await api.health();
       updateSystemStatus(await api.status());
-    } catch {
-      const offline = { backend_state: 'BACKEND_OFFLINE', model_state: 'MODEL_ERROR', rag_state: 'RAG_ERROR', vision_state: 'VISION_UNAVAILABLE', startup_error: 'Unable to connect to Nikola’s local backend.' };
-      updateSystemStatus(offline);
-      $('#header-state').textContent = 'OFFLINE';
-      $('#orb-status').textContent = 'OFFLINE';
+    } catch (error) {
+      const statusCode = Number(error?.status || 0);
+      const backendResponded = statusCode > 0;
+      const failure = {
+        backend_state: backendResponded
+          ? 'BACKEND_READY'
+          : error?.code === 'NETWORK_ERROR' ? 'BACKEND_OFFLINE' : 'BACKEND_UNKNOWN',
+        model_state: 'MODEL_UNKNOWN',
+        rag_state: 'RAG_UNKNOWN',
+        vision_state: 'VISION_UNAVAILABLE',
+        startup_error: error?.message || 'Nikola could not read local service status.',
+      };
+      updateSystemStatus(failure);
+      const headline = statusCode === 401 || statusCode === 403
+        ? 'AUTH ERROR'
+        : error?.code === 'TIMEOUT' ? 'TIMEOUT'
+        : backendResponded ? 'SERVICE ERROR' : 'OFFLINE';
+      $('#header-state').textContent = headline;
+      $('#orb-status').textContent = headline;
       $('#assistant-ball').dataset.state = 'error';
+    }
+  }
+
+  async function pollApplicationAction() {
+    if (state.actionPollInFlight) return;
+    state.actionPollInFlight = true;
+    try {
+      const action = await api.recentApplicationAction();
+      state.actionPollErrorLogged = false;
+      const updatedAt = Number(action.updated_at || 0);
+      if (
+        !action.id
+        || (action.id === state.lastApplicationActionId
+          && updatedAt <= state.lastApplicationActionUpdatedAt)
+      ) return;
+      state.lastApplicationActionId = action.id;
+      state.lastApplicationActionUpdatedAt = updatedAt;
+      if (updatedAt < state.startedAt) return;
+      if (action.message) {
+        setCenterActivity(action.message);
+        if (action.source === 'voice' || action.source === 'telegram') showToast(action.message);
+      }
+    } catch (error) {
+      if (!state.actionPollErrorLogged) {
+        console.error('Application action status polling failed.', error);
+        state.actionPollErrorLogged = true;
+      }
+    } finally {
+      state.actionPollInFlight = false;
     }
   }
 
@@ -224,7 +281,7 @@
     $('#assistant-ball').classList.toggle('generating', active);
   }
 
-  async function sendMessage() {
+  async function sendMessage(source = 'text') {
     const query = input.value.trim();
     if (!query || state.activeController) return;
     state.lastPrompt = query;
@@ -238,17 +295,37 @@
     setCenterSources([]);
     setCenterActivity('Generating a local response.');
     let pendingScroll = false;
+    let completedActionMessage = '';
     const scheduleScroll = () => {
       if (pendingScroll) return;
       pendingScroll = true;
       requestAnimationFrame(() => { pendingScroll = false; scrollMessages(); });
     };
     try {
-      await api.streamAnswer({ query, use_rag: $('#rag-toggle').checked, conversation_id: state.conversationId }, (event) => {
+      await api.streamAnswer({ query, use_rag: $('#rag-toggle').checked, conversation_id: state.conversationId, source }, (event) => {
         if (event.conversation_id) state.conversationId = event.conversation_id;
-        if (event.event) setCenterActivity(String(event.event).replaceAll('_', ' '));
+        if (event.action_id) state.lastApplicationActionId = event.action_id;
+        if (event.event === 'action_start') {
+          completedActionMessage = event.message || 'Running the requested application action.';
+          setCenterActivity(completedActionMessage);
+          showToast(completedActionMessage);
+        } else if (event.event === 'screen_analysis_start') {
+          setCenterActivity(event.message || 'Analyzing your screen locally...');
+        } else if (event.event) {
+          setCenterActivity(String(event.event).replaceAll('_', ' '));
+        }
         if (event.token) { answer.body.dataset.raw += event.token; answer.body.textContent += event.token; scheduleScroll(); }
-        if (event.answer) { answer.body.dataset.raw = event.answer; answer.body.textContent = event.answer; }
+        if (event.answer) {
+          const actionAnswer = event.action_state
+            ? `${event.action_state === 'succeeded' ? '✓' : event.action_state === 'failed' ? '✕' : '？'} ${event.answer}`
+            : event.answer;
+          answer.body.dataset.raw = actionAnswer;
+          answer.body.textContent = actionAnswer;
+          if (event.action_state) {
+            completedActionMessage = event.answer;
+            setCenterActivity(event.answer);
+          }
+        }
         if (event.event === 'complete') ui.renderMarkdown(answer.body, answer.body.dataset.raw || answer.body.textContent);
         if (event.sources?.length) { ui.renderSources(answer, event.sources); setCenterSources(event.sources); }
       }, controller.signal);
@@ -259,7 +336,12 @@
     } finally {
       state.activeController = null;
       setGenerating(false);
-      setCenterActivity('Ready for a local task.');
+      setCenterActivity(completedActionMessage || 'Ready for a local task.');
+      if (completedActionMessage) {
+        globalThis.setTimeout(() => {
+          if (!state.activeController) setCenterActivity('Ready for a local task.');
+        }, 4000);
+      }
       input.focus();
       scrollMessages();
     }
@@ -341,14 +423,28 @@
 
   async function analyzeScreen() {
     const output = $('#vision-result');
+    const button = $('#analyze-screen');
     output.classList.remove('hidden');
-    output.textContent = 'Analyzing locally…';
-    setCenterActivity('Analyzing the current screen locally.');
+    button.disabled = true;
+    button.textContent = 'Analyzing…';
+    output.textContent = 'Capturing screen…';
+    setCenterActivity('Capturing the current screen locally.');
     try {
-      const result = await api.solveScreen($('#vision-prompt').value.trim() || 'Analyze my current screen.');
+      const screenshot = await desktop.captureScreen();
+      output.textContent = 'Analyzing screen locally…';
+      setCenterActivity('Analyzing the current screen locally.');
+      const result = await api.solveScreen(
+        $('#vision-prompt').value.trim() || 'Analyze my current screen.',
+        screenshot,
+      );
       output.textContent = `${result.description}\n\n${result.solution}`;
+      setCenterActivity('Analysis complete.');
     } catch (error) { output.textContent = error.message; }
-    finally { setCenterActivity('Ready for a local task.'); }
+    finally {
+      button.disabled = false;
+      button.textContent = 'Analyze current screen';
+      window.setTimeout(() => setCenterActivity('Ready for a local task.'), 1500);
+    }
   }
 
   async function toggleVoiceRecording() {
@@ -375,7 +471,14 @@
         stream.getTracks().forEach((track) => track.stop());
         try {
           const result = await api.transcribe(new Blob(state.audioChunks, { type: recorder.mimeType || 'audio/webm' }));
-          if (result.text) { input.value = result.text; resizeComposer(); activatePanel('chat'); input.focus(); label.textContent = 'Transcription added to the composer'; }
+          if (result.text) {
+            input.value = result.text;
+            resizeComposer();
+            activatePanel('chat');
+            label.textContent = 'Sending your local transcription to Nikola…';
+            await sendMessage('voice');
+            label.textContent = 'Voice request completed';
+          }
           else label.textContent = result.error || 'Nikola could not hear a transcription.';
         } catch (error) { label.textContent = error.message; }
         finally { setCenterActivity('Ready for a local task.'); }
@@ -442,7 +545,14 @@
     $('#cancel-clear').addEventListener('click', () => $('#confirm-dialog').classList.add('hidden'));
     $('#confirm-clear').addEventListener('click', async () => { try { await api.clearDocuments(); $('#confirm-dialog').classList.add('hidden'); await loadDocuments(); showToast('The document vault has been cleared.'); } catch (error) { showToast(error.message); } });
     $('#reconnect').addEventListener('click', refreshStatus);
-    $('#restart-backend').addEventListener('click', () => desktop.restartBackend());
+    $('#restart-backend').addEventListener('click', async () => {
+      try {
+        const result = await desktop.restartBackend();
+        showToast(result?.message || 'Nikola returned no restart status.');
+      } catch (error) {
+        showToast(error?.message || 'The restart request failed before reaching the backend.');
+      }
+    });
     $('#analyze-screen').addEventListener('click', analyzeScreen);
     $('#voice-record').addEventListener('click', toggleVoiceRecording);
     $('#voice-trigger').addEventListener('click', () => { activatePanel('voice'); $('#voice-record').focus(); });
@@ -452,7 +562,10 @@
     desktop.onWindowMode(setMode);
     desktop.onNewChat(newChat);
     desktop.onOpenView((view) => { setMode('workspace'); activatePanel(view); });
-    desktop.onRestartBackend((result) => { showToast(result?.accepted ? 'Backend restart requested. Nikola will reconnect when it is ready.' : 'Nikola could not request a backend restart.'); refreshStatus(); });
+    desktop.onRestartBackend((result) => {
+      showToast(result?.message || 'The backend restart request did not return a status.');
+      refreshStatus();
+    });
   }
 
   bindEvents();
@@ -460,5 +573,7 @@
   resizeComposer();
   refreshStatus();
   setInterval(refreshStatus, 10_000);
+  pollApplicationAction();
+  setInterval(pollApplicationAction, 1_000);
   setMode('ball');
 })();

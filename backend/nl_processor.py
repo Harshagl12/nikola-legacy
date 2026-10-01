@@ -6,15 +6,18 @@ All methods are sync (called via executor from async context).
 
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 import psutil
 import mss
-from PIL import Image
 
+from backend.application_actions import (
+    action_status_message,
+    execute_application_plan,
+    parse_application_command,
+)
 from backend.logger import get_logger
 from backend.filesystem_policy import FileOperation, authorize_path
 
@@ -36,6 +39,17 @@ class NLProcessor:
         text_lower = text.lower().strip()
         
         try:
+            application_plan = parse_application_command(text)
+            if application_plan is not None:
+                result = execute_application_plan(application_plan)
+                return {
+                    "action": result.get("action", "application_action"),
+                    "description": action_status_message(result),
+                    "success": result.get("success", False),
+                    "result": result,
+                    "error": result.get("error"),
+                }
+
             # screenshot
             if any(x in text_lower for x in ["screenshot", "screen", "capture", "snap"]):
                 return self._screenshot()
@@ -102,15 +116,6 @@ class NLProcessor:
             elif any(x in text_lower for x in ["process", "task", "running"]):
                 return self._process_list()
             
-            # launch app
-            elif any(x in text_lower for x in ["launch", "open", "start", "run"]):
-                import re
-                match = re.search(r'(?:launch|open|start|run)\s+(.+)', text_lower)
-                app = match.group(1).strip() if match else ""
-                if app:
-                    return self._launch_application(app)
-                return {"action": "launch_app", "success": False, "error": "App not specified"}
-            
             # open directory
             elif any(x in text_lower for x in ["open folder", "open directory"]):
                 path = self._extract_path(text)
@@ -139,6 +144,8 @@ class NLProcessor:
     def _screenshot(self) -> dict:
         """Take screenshot."""
         try:
+            from PIL import Image
+
             with mss.mss() as sct:
                 # Capture primary monitor (index 1 is first actual monitor)
                 if len(sct.monitors) > 1:
@@ -539,42 +546,6 @@ class NLProcessor:
             return {
                 "action": "process_list",
                 "description": "Failed",
-                "success": False,
-                "error": str(e)
-            }
-
-    def _launch_application(self, app: str) -> dict:
-        """Launch application."""
-        try:
-            # Try direct subprocess
-            try:
-                proc = subprocess.Popen(
-                    app,
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=0x08000000  # CREATE_NO_WINDOW on Windows
-                )
-                return {
-                    "action": "launch_app",
-                    "description": f"Launched {app}",
-                    "success": True,
-                    "result": {"app": app, "pid": proc.pid}
-                }
-            except:
-                # Try os.startfile on Windows
-                os.startfile(app)
-                return {
-                    "action": "launch_app",
-                    "description": f"Launched {app}",
-                    "success": True,
-                    "result": {"app": app}
-                }
-        except Exception as e:
-            logger.error("Launch failed", app=app, error=str(e))
-            return {
-                "action": "launch_app",
-                "description": "Launch failed",
                 "success": False,
                 "error": str(e)
             }

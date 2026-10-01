@@ -75,6 +75,7 @@ build/
 out/
 release/
 /Nikola/
+/_internal/
 /nikola_launcher/build_tmp/
 /backend/tools/llama-avx2/
 
@@ -101,6 +102,7 @@ release/
 # Packaged binaries, test recordings, and generated media
 *.dll
 *.exe
+/nikola_icon.ico
 *.so
 *.dylib
 *.zip

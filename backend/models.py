@@ -3,7 +3,7 @@ All Pydantic v2 request/response models for NIKOLA backend.
 Never define models inline in main.py.
 """
 
-from typing import Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -19,6 +19,10 @@ class AskRequest(BaseModel):
         default=None, description="Conversation ID for multi-turn"
     )
     stream: Optional[bool] = Field(default=False, description="Stream SSE response")
+    source: Literal["text", "voice", "telegram"] = Field(
+        default="text",
+        description="Input modality; this never changes action permissions",
+    )
 
 
 class AskResponse(BaseModel):
@@ -27,6 +31,18 @@ class AskResponse(BaseModel):
     answer: str = Field(..., description="Generated answer")
     sources: list[str] = Field(default_factory=list, description="Source files used")
     conversation_id: str = Field(..., description="Conversation ID")
+    action_result: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Structured result when the request performs an application action",
+    )
+    action_state: Optional[str] = Field(
+        default=None,
+        description="Application action lifecycle state for the desktop UI",
+    )
+    action_id: Optional[str] = Field(
+        default=None,
+        description="Identifier for polling the application action lifecycle",
+    )
 
 
 class IndexRequest(BaseModel):
@@ -125,6 +141,7 @@ class VoiceTranscribeResponse(BaseModel):
 class ScreenRequest(BaseModel):
     """Request to analyze screen state."""
     query: Optional[str] = Field(default="Analyze this screen and diagnose potential issues.", description="Question about the screen")
+    screenshot_base64: Optional[str] = Field(default=None, description="Optional Electron-captured JPEG image")
 
 
 class SolveScreenResponse(BaseModel):
@@ -145,6 +162,10 @@ class StatusResponse(BaseModel):
     collection_size: int = Field(..., description="Total chunks in RAG")
     models_loaded: list[str] = Field(..., description="Loaded AI models")
     voice_active: bool = Field(..., description="Voice engine running")
+    voice_state: str = Field(default="VOICE_UNAVAILABLE", description="Voice lifecycle state")
+    microphone_state: str = Field(default="MICROPHONE_UNKNOWN", description="Physical microphone state")
+    microphone_device: Optional[str] = Field(default=None, description="Selected input device name")
+    wake_word: Optional[str] = Field(default=None, description="Configured wake phrase")
     uptime_seconds: float = Field(..., description="Backend uptime")
     backend_state: str = Field(default="BACKEND_READY", description="Verified backend lifecycle state")
     model_state: str = Field(default="MODEL_LOADING", description="Verified local model lifecycle state")
@@ -154,6 +175,7 @@ class StatusResponse(BaseModel):
     request_count: int = Field(default=0, description="Requests observed since startup")
     error_count: int = Field(default=0, description="Requests ending in a server error")
     average_latency_ms: float = Field(default=0.0, description="Average request latency in milliseconds")
+    service_errors: dict[str, str] = Field(default_factory=dict, description="Optional service initialization errors")
 
 
 # === NL Models ===
@@ -178,6 +200,8 @@ class NLCommandResponse(BaseModel):
     healing_explanation: Optional[str] = Field(default=None)
     healing_log: Optional[list] = Field(default=None)
     confidence: Optional[float] = Field(default=None)
+    action_id: Optional[str] = Field(default=None)
+    action_state: Optional[str] = Field(default=None)
 
 
 class IntentResult(BaseModel):

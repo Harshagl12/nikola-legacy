@@ -8,7 +8,6 @@ import asyncio
 import re
 import threading
 import time
-from collections import deque
 from typing import Optional
 import tempfile
 import wave
@@ -73,6 +72,10 @@ class VoiceEngine:
         self.tts_engine = None
         self.vad = None
         self._audio_backend = None
+        self._microphone_state = "MICROPHONE_UNKNOWN"
+        self._microphone_device: Optional[str] = None
+        self._microphone_index: Optional[int] = None
+        self._last_voice_error: Optional[str] = None
         self._energy_threshold = 280.0
         self._wake_detect_frames = 18
         self._silence_frames_commit = 25
@@ -114,6 +117,68 @@ class VoiceEngine:
         
         logger.info("Voice engine initialized", wake_word=self.wake_word, backend=self._audio_backend)
 
+    @property
+    def microphone_state(self) -> str:
+        """Return the last observed physical microphone state."""
+        return self._microphone_state
+
+    @property
+    def microphone_device(self) -> Optional[str]:
+        """Return the selected physical input device name."""
+        return self._microphone_device
+
+    @property
+    def last_voice_error(self) -> Optional[str]:
+        """Return a safe diagnostic for the last microphone failure."""
+        return self._last_voice_error
+
+    def _set_microphone_state(
+        self,
+        state: str,
+        *,
+        error: Optional[str] = None,
+    ) -> None:
+        self._microphone_state = state
+        self._last_voice_error = error
+        logger.info(
+            "Microphone state changed",
+            state=state,
+            device_index=self._microphone_index,
+            device=self._microphone_device,
+            error=error,
+        )
+
+    def _choose_sounddevice_input(self) -> Optional[int]:
+        """Choose the default usable input, then the first usable input."""
+        if not SOUNDDEVICE_AVAILABLE:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception as error:
+            self._set_microphone_state("MICROPHONE_UNAVAILABLE", error=str(error))
+            return None
+
+        candidates: list[int] = []
+        try:
+            default_input = sd.default.device[0]
+            if isinstance(default_input, int) and default_input >= 0:
+                candidates.append(default_input)
+        except Exception:
+            pass
+        candidates.extend(index for index in range(len(devices)) if index not in candidates)
+
+        for index in candidates:
+            try:
+                device = devices[index]
+                if device.get("max_input_channels", 0) > 0:
+                    self._microphone_index = index
+                    self._microphone_device = str(device.get("name") or f"input-{index}")
+                    return index
+            except (IndexError, TypeError, AttributeError):
+                continue
+        self._set_microphone_state("MICROPHONE_UNAVAILABLE", error="No input microphone device found")
+        return None
+
     def _is_speech_frame(self, frame: bytes) -> bool:
         """Detect if frame contains speech using WebRTC VAD or RMS fallback."""
         if self.vad is not None:
@@ -154,7 +219,7 @@ class VoiceEngine:
             logger.error("TTS failed", error=str(e))
 
 
-    def _transcribe(self, pcm_frames: list[bytes]) -> str:
+    def _transcribe(self, pcm_frames: list[bytes], purpose: str = "utterance") -> str:
         """Transcribe PCM frames using faster-Whisper.
         
         Args:
@@ -168,6 +233,7 @@ class VoiceEngine:
         
         temp_path = None
 
+        started = time.perf_counter()
         try:
             # Join frames and convert to audio
             audio_bytes = b"".join(pcm_frames)
@@ -189,7 +255,12 @@ class VoiceEngine:
             )
             
             text = " ".join(segment.text for segment in segments).strip().lower()
-            logger.debug("Transcribed audio", text_length=len(text))
+            logger.info(
+                "Audio transcribed",
+                purpose=purpose,
+                text_length=len(text),
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             return text
         except Exception as e:
             logger.error("Transcription failed", error=str(e))
@@ -208,29 +279,6 @@ class VoiceEngine:
         stream = None
 
         try:
-            def choose_sounddevice_input() -> Optional[int]:
-                try:
-                    devices = sd.query_devices()
-                except Exception:
-                    return None
-
-                try:
-                    default_input = sd.default.device[0]
-                    if isinstance(default_input, int) and default_input >= 0:
-                        if devices[default_input]["max_input_channels"] > 0:
-                            return default_input
-                except Exception:
-                    pass
-
-                for idx, dev in enumerate(devices):
-                    try:
-                        if dev.get("max_input_channels", 0) > 0:
-                            return idx
-                    except Exception:
-                        continue
-
-                return None
-
             logger.info("Voice listening loop started", backend=self._audio_backend)
 
             while self._running:
@@ -245,12 +293,15 @@ class VoiceEngine:
                             frames_per_buffer=FRAME_SIZE,
                             exception_on_overflow=False
                         )
+                        self._microphone_index = None
+                        self._microphone_device = "PyAudio default input"
+                        self._set_microphone_state("MICROPHONE_READY")
 
                         def read_frame() -> bytes:
                             return stream.read(FRAME_SIZE, exception_on_overflow=False)
 
                     elif self._audio_backend == "sounddevice":
-                        input_device = choose_sounddevice_input()
+                        input_device = self._choose_sounddevice_input()
                         if input_device is None:
                             raise RuntimeError("No input microphone device found")
 
@@ -262,77 +313,101 @@ class VoiceEngine:
                             device=input_device
                         )
                         stream.start()
+                        self._set_microphone_state("MICROPHONE_READY")
                         logger.info("Using microphone device", device_index=input_device)
 
                         def read_frame() -> bytes:
                             data, overflowed = stream.read(FRAME_SIZE)
+                            if overflowed:
+                                logger.warning("Microphone input overflow detected")
                             return bytes(data)
                     else:
                         logger.error("No audio backend selected")
                         return
 
-                    ring_buffer = deque(maxlen=80)
-                    speech_frames = 0
+                    utterance_frames: list[bytes] = []
                     silent_frames = 0
+                    speech_started_at = None
 
                     while self._running:
                         try:
                             frame = read_frame()
-                            ring_buffer.append(frame)
-
                             is_speech = self._is_speech_frame(frame)
+                            if is_speech:
+                                if not utterance_frames:
+                                    speech_started_at = time.perf_counter()
+                                utterance_frames.append(frame)
+                                silent_frames = 0
+                            elif utterance_frames:
+                                silent_frames += 1
 
-                            if self._state == "IDLE":
-                                if is_speech:
-                                    speech_frames += 1
-                                else:
-                                    speech_frames = 0
+                            # Transcribe one complete utterance rather than repeatedly
+                            # sending short rolling buffers to Whisper while idle.
+                            utterance_complete = (
+                                utterance_frames
+                                and (
+                                    silent_frames >= self._silence_frames_commit
+                                    or len(utterance_frames) >= 200
+                                )
+                            )
+                            if utterance_complete:
+                                purpose = (
+                                    "wake_detection"
+                                    if self._state == "IDLE"
+                                    else "command"
+                                )
+                                command_started_at = speech_started_at or time.perf_counter()
+                                text = self._transcribe(utterance_frames, purpose=purpose)
+                                utterance_frames = []
+                                silent_frames = 0
+                                speech_started_at = None
 
-                                if speech_frames >= self._wake_detect_frames:
-                                    text = self._transcribe(list(ring_buffer))
-                                    if self.wake_word in text:
-                                        logger.info("Wake word detected")
-                                        self._state = "LISTENING"
-                                        if self._loop is not None:
-                                            asyncio.run_coroutine_threadsafe(
-                                                self._async_speak("Yes?"),
-                                                self._loop
-                                            )
-                                        speech_frames = 0
-                                        silent_frames = 0
-                                        ring_buffer.clear()
-                                    else:
-                                        speech_frames = 0
-
-                            elif self._state == "LISTENING":
-                                if is_speech:
-                                    silent_frames = 0
-                                else:
-                                    silent_frames += 1
-
-                                if silent_frames >= self._silence_frames_commit:
-                                    text = self._transcribe(list(ring_buffer))
-                                    if text:
-                                        query = text.replace(self.wake_word, "").strip(" ,.!?\n\t")
-                                        if not query:
-                                            query = text
+                                if self._state == "IDLE":
+                                    if self._contains_wake_word(text):
+                                        logger.info(
+                                            "Wake word detected",
+                                            wake_latency_ms=round(
+                                                (time.perf_counter() - command_started_at) * 1000,
+                                                1,
+                                            ),
+                                        )
+                                        query = self._remove_wake_word(text).strip(" ,.!?\n\t")
+                                        if query:
+                                            logger.info("Recognized command", text=query)
+                                            if self._loop is not None:
+                                                asyncio.run_coroutine_threadsafe(
+                                                    self._handle_query(query, command_started_at),
+                                                    self._loop,
+                                                )
+                                            self._state = "IDLE"
+                                        else:
+                                            self._state = "LISTENING"
+                                            if self._loop is not None:
+                                                asyncio.run_coroutine_threadsafe(
+                                                    self._async_speak("Yes?"),
+                                                    self._loop,
+                                                )
+                                elif self._state == "LISTENING":
+                                    query = self._remove_wake_word(text).strip(" ,.!?\n\t")
+                                    if query:
                                         logger.info("Recognized command", text=query)
                                         if self._loop is not None:
                                             asyncio.run_coroutine_threadsafe(
-                                                self._handle_query(query),
-                                                self._loop
+                                                self._handle_query(query, command_started_at),
+                                                self._loop,
                                             )
                                     self._state = "IDLE"
-                                    silent_frames = 0
-                                    ring_buffer.clear()
+                                continue
 
                         except (IOError, OSError) as e:
                             logger.warning("Audio stream error", error=str(e))
-                            continue
+                            self._set_microphone_state("MICROPHONE_UNAVAILABLE", error=str(e))
+                            break
 
                 except Exception as e:
                     # Keep retrying if device is temporarily unavailable/busy.
                     logger.error("Listen loop error", error=str(e))
+                    self._set_microphone_state("MICROPHONE_UNAVAILABLE", error=str(e))
                     if self._running:
                         time.sleep(3)
                 finally:
@@ -357,6 +432,7 @@ class VoiceEngine:
         except Exception as e:
             logger.error("Listen loop error", error=str(e))
         finally:
+            self._set_microphone_state("MICROPHONE_STOPPED")
             self._running = False
 
     async def _async_speak(self, text: str) -> None:
@@ -364,17 +440,46 @@ class VoiceEngine:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self.speak, text)
 
-    async def _handle_query(self, query: str) -> None:
+    def _contains_wake_word(self, text: str) -> bool:
+        """Accept the configured phrase and the assistant's spoken name."""
+        normalized = " ".join(text.lower().split())
+        configured = " ".join(self.wake_word.split())
+        return configured in normalized or re.search(r"\bnikola\b", normalized) is not None
+
+    def _remove_wake_word(self, text: str) -> str:
+        """Remove a configured wake phrase or a spoken Nikola prefix."""
+        normalized = text
+        if self.wake_word:
+            normalized = re.sub(
+                re.escape(self.wake_word),
+                "",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        return re.sub(r"\b(?:hey\s+)?nikola\b", "", normalized, flags=re.IGNORECASE)
+
+    async def _handle_query(
+        self,
+        query: str,
+        command_started_at: float | None = None,
+    ) -> None:
         """Handle recognized query by calling backend /ask.
         
         Args:
             query: Recognized query text
         """
+        started = time.perf_counter()
+        api_key = settings.NIKOLA_API_KEY
+        if not api_key:
+            logger.error("Voice command refused because the configured API key is missing")
+            await self._async_speak("Nikola could not authenticate with the local backend.")
+            return
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 response = await client.post(
                     f"{self.backend_url}/ask",
-                    json={"query": query, "use_rag": True}
+                    json={"query": query, "use_rag": True, "source": "voice"},
+                    headers={"X-API-Key": api_key},
                 )
                 
                 if response.status_code == 200:
@@ -382,9 +487,33 @@ class VoiceEngine:
                     answer = data.get("answer", "")
                     await self._async_speak(answer)
                 else:
-                    logger.error("Backend /ask failed", status=response.status_code)
+                    logger.error(
+                        "Backend voice request failed",
+                        status=response.status_code,
+                        elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+                        voice_to_response_ms=round(
+                            (time.perf_counter() - command_started_at) * 1000,
+                            1,
+                        ) if command_started_at else None,
+                    )
+                    if response.status_code == 401:
+                        await self._async_speak("Nikola's local backend rejected the voice request.")
+                    elif response.status_code == 503:
+                        await self._async_speak("Nikola's local services are still starting.")
+                    else:
+                        await self._async_speak("Nikola could not complete that voice request.")
+                logger.info(
+                    "Voice request completed",
+                    status=response.status_code,
+                    elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+                    voice_to_response_ms=round(
+                        (time.perf_counter() - command_started_at) * 1000,
+                        1,
+                    ) if command_started_at else None,
+                )
         except Exception as e:
             logger.error("Query handler error", error=str(e))
+            await self._async_speak("Nikola could not connect to the local backend.")
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start voice engine.

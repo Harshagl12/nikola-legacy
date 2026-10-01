@@ -52,7 +52,8 @@ class ModelRegistry:
             "model_id": "moondream2",
             "type": "vision_encoder",
             "role": "Desktop Screenshot & Visual Diagnosis",
-            "path": "C:/nikola/backend/models/moondream2.gguf",
+            "path": settings.resolve_path(settings.VISION_MODEL_PATH),
+            "mmproj_path": settings.resolve_path(settings.VISION_MMPROJ_PATH),
             "vram_budget_mb": 1200,
             "system_ram_mb": 800,
             "always_loaded": False  # Load on-demand for /solve-screen

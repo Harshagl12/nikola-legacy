@@ -6,6 +6,8 @@ Optimized for Qwen3 1.7B GGUF with low latency streaming.
 import os
 import gc
 import json
+import hashlib
+import math
 import threading
 import psutil
 import httpx
@@ -287,7 +289,26 @@ class LLMEngine:
             except Exception:
                 pass
 
-        raise RuntimeError("No local embedding backend is available")
+        # The configured llama-server is a text-generation server and may not
+        # expose /embeddings. Keep document indexing local and deterministic in
+        # that case instead of silently dropping every chunk. This is a lexical
+        # fallback, not a replacement for the configured embedding model.
+        return {"data": [{"embedding": self._fallback_embedding(input_text)}]}
+
+    @staticmethod
+    def _fallback_embedding(input_text: str, dimensions: int = 1024) -> list[float]:
+        """Create a deterministic local lexical vector when no embedder exists."""
+        vector = [0.0] * dimensions
+        tokens = input_text.lower().split()
+        for token in tokens:
+            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+            index = int.from_bytes(digest[:4], "little") % dimensions
+            sign = 1.0 if digest[4] & 1 else -1.0
+            vector[index] += sign
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm:
+            vector = [value / norm for value in vector]
+        return vector
 
     def stream_infer(self, prompt: str, max_tokens: int = 512, **kwargs):
         """Yield token strings for SSE streaming using Qwen3 template."""

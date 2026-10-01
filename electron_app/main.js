@@ -1,8 +1,9 @@
-const { app, BrowserWindow, Menu, ipcMain, nativeImage, session, screen, shell, dialog, Tray } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, nativeImage, session, screen, shell, dialog, Tray, desktopCapturer } = require('electron');
 app.disableHardwareAcceleration();
 const path = require('path');
 const fs = require('fs');
 const httpx = require('http');
+const crypto = require('crypto');
 
 // Avoid GPU/cache crashes on machines where Chromium cannot write its default cache.
 app.commandLine.appendSwitch('disable-gpu');
@@ -16,7 +17,7 @@ let appVersion = '1.0.0';
 let tray;
 let isWorkspaceVisible = false;
 let isQuitting = false;
-const API_KEY = process.env.NIKOLA_API_KEY || "";
+const API_KEY = process.env.NIKOLA_API_KEY;
 const defaultBallPosition = { x: 32, y: 32 };
 let ballPosition = { ...defaultBallPosition };
 
@@ -24,6 +25,15 @@ function safeCoordinate(value, fallback) {
   if (value === null || value === undefined) return fallback;
   const numericValue = Number(value);
   return Number.isFinite(numericValue) ? Math.round(numericValue) : fallback;
+}
+
+function apiKeyMetadata(value) {
+  if (!value) return { exists: false, length: 0, sha256Prefix: null };
+  return {
+    exists: true,
+    length: value.length,
+    sha256Prefix: crypto.createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 16),
+  };
 }
 
 function loadBallPosition() {
@@ -131,12 +141,33 @@ function showWorkspace() {
 
 // App ready
 app.on('ready', () => {
+  const keyMetadata = apiKeyMetadata(API_KEY);
+  console.info(
+    '[Nikola auth] key source=launcher environment',
+    `exists=${keyMetadata.exists}`,
+    `length=${keyMetadata.length}`,
+    `sha256_prefix=${keyMetadata.sha256Prefix || 'none'}`
+  );
   // Allow microphone permission requests only for the local application window.
   const ses = session.defaultSession;
   ses.webRequest.onBeforeSendHeaders(
     { urls: ['http://127.0.0.1:8000/*', 'http://localhost:8000/*'] },
     (details, callback) => {
-      details.requestHeaders['X-API-Key'] = API_KEY;
+      if (API_KEY) {
+        details.requestHeaders['X-API-Key'] = API_KEY;
+        if (['/status', '/ask', '/solve-screen'].includes(new URL(details.url).pathname)) {
+          const metadata = apiKeyMetadata(details.requestHeaders['X-API-Key']);
+          console.info(
+            '[Nikola auth] renderer request',
+            `path=${new URL(details.url).pathname}`,
+            `header_exists=${metadata.exists}`,
+            `header_length=${metadata.length}`,
+            `header_sha256_prefix=${metadata.sha256Prefix || 'none'}`
+          );
+        }
+      } else {
+        delete details.requestHeaders['X-API-Key'];
+      }
       callback({ cancel: false, requestHeaders: details.requestHeaders });
     }
   );
@@ -193,7 +224,7 @@ ipcMain.on('ball-context-menu', () => {
     { label: 'Documents', click: () => { showWorkspace(); if (mainWindow) mainWindow.webContents.send('open-view', 'documents'); } },
     { label: 'Voice', click: () => { showWorkspace(); if (mainWindow) mainWindow.webContents.send('open-view', 'voice'); } },
     { label: 'Settings', click: () => { showWorkspace(); if (mainWindow) mainWindow.webContents.send('open-view', 'settings'); } },
-    { label: 'Restart Backend', click: requestBackendRestart },
+    { label: 'Restart Backend', click: () => requestBackendRestart({ notifyRenderer: true }) },
     { type: 'separator' },
     { label: 'Quit Nikola', click: quitNikola }
   ]);
@@ -218,6 +249,36 @@ ipcMain.handle('get-version', () => {
 });
 
 ipcMain.handle('get-window-mode', () => isWorkspaceVisible ? 'workspace' : 'ball');
+ipcMain.handle('capture-screen', async () => {
+  if (!mainWindow) throw new Error('Nikola window is unavailable.');
+
+  const wasVisible = mainWindow.isVisible();
+  const wasMaximized = mainWindow.isMaximized();
+  const targetDisplay = screen.getDisplayMatching(mainWindow.getBounds());
+  try {
+    mainWindow.hide();
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: {
+        width: Math.max(640, Math.min(targetDisplay.bounds.width, 1920)),
+        height: Math.max(360, Math.min(targetDisplay.bounds.height, 1080)),
+      },
+      fetchWindowIcons: false,
+    });
+    const source = sources.find((item) => String(item.display_id) === String(targetDisplay.id));
+    if (!source || source.thumbnail.isEmpty()) {
+      throw new Error('The underlying display could not be captured.');
+    }
+    return source.thumbnail.toJPEG(82).toString('base64');
+  } finally {
+    if (wasVisible) {
+      mainWindow.show();
+      if (wasMaximized && !mainWindow.isMaximized()) mainWindow.maximize();
+      mainWindow.focus();
+    }
+  }
+});
 
 ipcMain.handle('choose-documents', async () => {
   if (!mainWindow) return [];
@@ -229,21 +290,58 @@ ipcMain.handle('choose-documents', async () => {
   return result.canceled ? [] : result.filePaths;
 });
 
-function requestBackendRestart() {
-  const req = httpx.request({
-    hostname: '127.0.0.1',
-    port: 8000,
-    path: '/system/restart',
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': '2', 'X-API-Key': API_KEY },
-    timeout: 4000
-  }, (res) => {
-    res.resume();
-    if (mainWindow) mainWindow.webContents.send('restart-backend', { accepted: res.statusCode === 200 });
+function requestBackendRestart({ notifyRenderer = false } = {}) {
+  return new Promise((resolve) => {
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': '2' };
+    if (API_KEY) {
+      headers['X-API-Key'] = API_KEY;
+      const metadata = apiKeyMetadata(headers['X-API-Key']);
+      console.info(
+        '[Nikola auth] restart request',
+        `header_exists=${metadata.exists}`,
+        `header_length=${metadata.length}`,
+        `header_sha256_prefix=${metadata.sha256Prefix || 'none'}`
+      );
+    }
+    const req = httpx.request({
+      hostname: '127.0.0.1',
+      port: 8000,
+      path: '/system/restart',
+      method: 'POST',
+      headers,
+      timeout: 4000
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        let payload = {};
+        try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* Error body is optional. */ }
+        const accepted = res.statusCode === 200;
+        const result = {
+          accepted,
+          status: res.statusCode || 0,
+          code: accepted ? 'RESTART_ACCEPTED' : `HTTP_${res.statusCode || 0}`,
+          message: accepted
+            ? 'Backend restart accepted.'
+            : payload.detail || `Backend restart failed with HTTP ${res.statusCode || 0}.`,
+        };
+        if (notifyRenderer && mainWindow) mainWindow.webContents.send('restart-backend', result);
+        resolve(result);
+      });
+    });
+    req.on('timeout', () => req.destroy(Object.assign(new Error('Backend restart request timed out.'), { code: 'ETIMEDOUT' })));
+    req.on('error', (error) => {
+      const result = {
+        accepted: false,
+        status: 0,
+        code: error.code || 'NETWORK_ERROR',
+        message: error.message || 'Could not connect to the local backend.',
+      };
+      if (notifyRenderer && mainWindow) mainWindow.webContents.send('restart-backend', result);
+      resolve(result);
+    });
+    req.end('{}');
   });
-  req.on('timeout', () => req.destroy());
-  req.on('error', () => { if (mainWindow) mainWindow.webContents.send('restart-backend', { accepted: false }); });
-  req.end('{}');
 }
 
 ipcMain.handle('restart-backend', () => requestBackendRestart());
@@ -298,7 +396,7 @@ function createTrayMenu() {
     },
     { label: 'New Chat', click: () => { if (mainWindow) mainWindow.webContents.send('new-chat'); showWorkspace(); } },
     { label: 'Documents', click: () => { showWorkspace(); if (mainWindow) mainWindow.webContents.send('open-view', 'documents'); } },
-    { label: 'Restart Backend', click: requestBackendRestart },
+    { label: 'Restart Backend', click: () => requestBackendRestart({ notifyRenderer: true }) },
     { type: 'separator' },
     {
       label: 'Quit Nikola', click: quitNikola

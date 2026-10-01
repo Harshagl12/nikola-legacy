@@ -27,6 +27,17 @@ def test_auth(monkeypatch):
     res_valid = client.get("/status", headers={"X-API-Key": valid_key})
     assert res_valid.status_code == 200
     assert "indexed_files" in res_valid.json()
+    assert client.get("/api/status").status_code == 401
+    assert client.get("/actions/recent").status_code == 401
+    assert client.get(
+        "/api/status",
+        headers={"X-API-Key": valid_key},
+    ).status_code == 200
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code != 401
+    assert client.post("/ask", json={"query": "hi"}).status_code == 401
+    assert client.post("/solve-screen").status_code == 401
 
     tool_res = client.post(
         "/tools/execute",

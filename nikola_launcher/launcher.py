@@ -9,6 +9,7 @@ Architecture:
 
 import sys
 import os
+import json
 import queue
 import socket
 import threading
@@ -101,13 +102,12 @@ def main():
             sys.exit(0)
 
         # Ensure nikola_launcher package is importable
-        sys.path.insert(0, str(NIKOLA_ROOT))
         if not getattr(sys, "frozen", False):
-            # Running from source: add the launcher directory to sys.path
+            # Running from source: keep project packages and launcher modules importable.
+            sys.path.insert(0, str(NIKOLA_ROOT))
             sys.path.insert(0, str(BASE_DIR))
-        else:
-            # Frozen: PyInstaller bundles everything alongside the exe
-            sys.path.insert(0, str(BASE_DIR))
+        # Frozen builds must resolve third-party packages from PyInstaller's
+        # isolated runtime, not copied package folders beside Nikola.exe.
 
         from dep_installer   import DepInstaller
         from process_manager import ProcessManager
@@ -137,9 +137,12 @@ def main():
         # ── Worker thread ────────────────────────────────────────────────────────
         def worker():
             try:
+                pm._load_env()
+
                 # 1
                 advance("Checking Qwen3 1.7B engine...")
                 pm.ensure_llama_server()
+                pm.ensure_vision_server()
 
                 # 2
                 advance("Verifying local AI models...")
@@ -148,8 +151,9 @@ def main():
 
                 # 3
                 advance("Checking vault folder...")
-                vault = Path(os.path.expanduser(os.getenv("VAULT_PATH", "~/vault")))
-                vault.mkdir(parents=True, exist_ok=True)
+                from backend.filesystem_policy import local_vault_path
+
+                local_vault_path(os.getenv("VAULT_PATH", str(NIKOLA_ROOT / "vault")))
 
                 # 4
                 advance("Setting up backend environment...")
@@ -168,7 +172,7 @@ def main():
                 if setup.is_first_run():
                     post(MSG_WIZARD, "")
                     reply_q.get()   # block until wizard finishes
-                    pm._load_env()
+                pm._load_env(require_api_key=True)
 
                 # 8
                 advance("Starting Nikola backend...")
@@ -176,11 +180,14 @@ def main():
                     raise RuntimeError("Nikola's local backend could not be started.")
 
                 # 9
-                advance("Verifying local model and document services...")
-                if not health.wait_for_backend(timeout=45):
-                    logger.warning(
-                        "Local model services did not become ready within 45 seconds; "
-                        "opening Nikola in degraded mode. Check backend/backend.log."
+                advance("Confirming Nikola backend is responding...")
+                if not health.wait_for_backend(
+                    timeout=20,
+                    process=pm.processes.get("backend"),
+                ):
+                    raise RuntimeError(
+                        "Nikola's backend exited or did not expose its health endpoint. "
+                        "Check backend/backend.log."
                     )
 
                 # 10
@@ -196,7 +203,7 @@ def main():
                 pm.start_watchdog()
 
                 # 13
-                advance("All systems ready!")
+                advance("Backend online; local services are initializing...")
                 time.sleep(1)
 
                 post(MSG_DONE, "")
@@ -316,5 +323,34 @@ def main():
         sys.exit(1)
 
 
+def _pillow_self_test(report_path: Path) -> int:
+    """Import Pillow through this runtime and write a non-secret test report."""
+    try:
+        import PIL
+        from PIL import Image, ImageGrab
+        import PIL._imaging
+
+        report = {
+            "ok": True,
+            "pillow": str(Path(PIL.__file__).resolve()),
+            "image": str(Path(Image.__file__).resolve()),
+            "image_grab": str(Path(ImageGrab.__file__).resolve()),
+            "imaging": str(Path(PIL._imaging.__file__).resolve()),
+        }
+    except Exception as error:
+        report = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+    report_path.write_text(
+        json.dumps(report, indent=2),
+        encoding="utf-8",
+    )
+    return 0 if report["ok"] else 1
+
+
 if __name__ == "__main__":
+    self_test_argument = next(
+        (argument for argument in sys.argv[1:] if argument.startswith("--pillow-self-test=")),
+        None,
+    )
+    if self_test_argument:
+        sys.exit(_pillow_self_test(Path(self_test_argument.split("=", 1)[1])))
     main()

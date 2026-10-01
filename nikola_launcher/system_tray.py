@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 import pystray
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 try:
     import ctypes
@@ -21,16 +21,9 @@ except Exception:
     WIN32_AVAILABLE = False
 
 
-def _make_icon():
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((4, 4, 60, 60), fill="#7c6af7")
-    try:
-        font = ImageFont.truetype("arialbd.ttf", 32)
-    except Exception:
-        font = ImageFont.load_default()
-    draw.text((32, 32), "N", font=font, fill="white", anchor="mm")
-    return img
+def _make_icon(icon_path: Path):
+    with Image.open(icon_path) as image:
+        return image.convert("RGBA").resize((64, 64), Image.Resampling.LANCZOS)
 
 
 class NikolaTray:
@@ -90,8 +83,11 @@ class NikolaTray:
         self.pm.start_electron()
 
     def _open_vault(self, icon=None, item=None):
-        vault = Path(os.getenv("VAULT_PATH", str(Path.home() / "vault")))
-        vault.mkdir(parents=True, exist_ok=True)
+        from backend.filesystem_policy import local_vault_path
+
+        vault = local_vault_path(
+            os.getenv("VAULT_PATH", str(self.nikola_root / "vault"))
+        )
         if sys.platform == "win32":
             os.startfile(str(vault))
 
@@ -143,9 +139,10 @@ class NikolaTray:
 
     def run(self):
         self._running = True
+        icon_root = Path(getattr(sys, "_MEIPASS", self.nikola_root / "nikola_launcher"))
         self.icon = pystray.Icon(
             "Nikola",
-            _make_icon(),
+            _make_icon(icon_root / "nikola_icon.ico"),
             "Nikola AI",
             menu=self._build_menu(),
         )
